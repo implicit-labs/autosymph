@@ -199,8 +199,15 @@ def step_collect_linear_key(state: WizardState, prompter: Prompter) -> WizardSta
         # The real client used downstream is built from the wizard state after
         # the project is selected (LinearClient takes project_name in __init__).
         check_client = LinearClient(api_key=key, project_name="__wizard_probe__")
+
+        async def _probe() -> str:
+            try:
+                return await check_client.resolve_viewer()
+            finally:
+                await check_client.close()
+
         try:
-            viewer_id = asyncio.run(check_client.resolve_viewer())
+            viewer_id = asyncio.run(_probe())
         except Exception as exc:
             logger.warning("Linear API key validation failed: %s", exc)
             if not prompter.confirm(
@@ -208,8 +215,6 @@ def step_collect_linear_key(state: WizardState, prompter: Prompter) -> WizardSta
             ):
                 raise WizardAborted("collect_linear_key")
             continue
-        finally:
-            asyncio.run(check_client._client.aclose())
 
         state.linear_api_key = key
         state.viewer_user_id = viewer_id

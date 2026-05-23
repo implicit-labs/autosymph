@@ -63,10 +63,12 @@ def run_wizard(prompter: Prompter | None = None) -> int:
                 steps.step_verify_via_find_configs(state)
                 steps.step_print_next_steps(state)
             finally:
-                # Close the httpx client that backs LinearClient.
+                # Close the httpx clients that back LinearClient. Each step
+                # ran its own asyncio.run, so LinearClient may hold one
+                # client per (now-dead) loop. ``close()`` drops them safely.
                 import asyncio
                 try:
-                    asyncio.run(linear._client.aclose())
+                    asyncio.run(linear.close())
                 except Exception:
                     pass
     except WizardAlreadyConfigured as exc:

@@ -75,15 +75,39 @@ class LinearClient:
         # LINEAR_API_URL env var lets test harnesses redirect to a stub server.
         # Undocumented for end users; production should use the default.
         self.api_url = os.environ.get("LINEAR_API_URL", self.API_URL)
-        self._client = httpx.AsyncClient(
-            headers={"Authorization": resolved_key, "Content-Type": "application/json"},
-            timeout=30.0,
-        )
+        # httpx's AsyncClient binds its transport to the event loop on first
+        # use. Reusing one client across multiple asyncio.run() invocations
+        # crashes with "Event loop is closed" when httpcore tries to close
+        # pooled connections. Defer creation and rebind per-loop.
+        self._client_headers = {
+            "Authorization": resolved_key,
+            "Content-Type": "application/json",
+        }
+        self._client_for_loop: dict[int, httpx.AsyncClient] = {}
 
     @property
     def is_configured(self) -> bool:
         """True if the API key is set."""
         return bool(self._api_key)
+
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        """Per-event-loop httpx client.
+
+        Each running event loop gets its own client. This keeps the wizard
+        (which calls ``asyncio.run`` once per step) and the long-running
+        orchestrator (one loop, one client) both correct without callers
+        needing to think about loop lifecycle.
+        """
+        loop = asyncio.get_running_loop()
+        client = self._client_for_loop.get(id(loop))
+        if client is None:
+            client = httpx.AsyncClient(
+                headers=self._client_headers,
+                timeout=30.0,
+            )
+            self._client_for_loop[id(loop)] = client
+        return client
 
     async def resolve_project(self) -> str:
         """Resolve project name to ID (case-insensitive). Cached after first call."""
@@ -652,4 +676,19 @@ class LinearClient:
         return asset_url
 
     async def close(self) -> None:
-        await self._client.aclose()
+        """Close the client bound to the current event loop, if any.
+
+        Clients bound to other (no-longer-running) loops are dropped without
+        an explicit close — httpcore's ``aclose`` would crash against their
+        dead loops. Their connection pools are garbage-collected.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._client_for_loop.clear()
+            return
+        client = self._client_for_loop.pop(id(loop), None)
+        if client is not None:
+            await client.aclose()
+        # Drop references to clients on other loops; they're unusable now.
+        self._client_for_loop.clear()
