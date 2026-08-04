@@ -14,6 +14,7 @@ Trace structure:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -144,6 +145,12 @@ class BraintrustTracer:
 
         if event.type == EventType.ASSISTANT_TURN:
             self._handle_turn(run, event)
+        elif event.type == EventType.ASSISTANT_MESSAGE:
+            text = event.data.get("text")
+            if isinstance(text, str) and text.strip():
+                run.pending_intent.append(text.strip())
+        elif event.type == EventType.TOOL_CALL:
+            self._handle_tool_call(run, event)
         elif event.type == EventType.TOOL_RESULT:
             self._handle_result(run, event)
 
@@ -228,36 +235,81 @@ class BraintrustTracer:
             run.pending_intent.clear()
 
             for block in tool_uses:
-                tool_id = block.get("id")
-                tool_name = block.get("name", "unknown")
-                tool_input = block.get("input", {})
-
-                # Build span name: "Bash: git log..." or "Skill: github-pr"
-                detail = _extract_detail(tool_name, tool_input)
-                span_name = f"{tool_name}: {detail}" if detail else tool_name
-
-                span_type = "function" if tool_name == "Skill" else "tool"
-                child = run.span.start_span(
-                    name=span_name,
-                    type=span_type,
-                    input=tool_input,
-                    metadata={"intent": intent} if intent else {},
+                self._open_tool(
+                    run,
+                    tool_id=block.get("id"),
+                    tool_name=block.get("name", "unknown"),
+                    tool_input=block.get("input", {}),
+                    intent=intent,
                 )
 
-                # Track summary stats
-                run.total_tools += 1
-                run.tools_used[tool_name] = run.tools_used.get(tool_name, 0) + 1
-                if tool_name == "Skill":
-                    run.skills.append(tool_input.get("skill", ""))
+    def _handle_tool_call(self, run: _RunState, event: AgentEvent) -> None:
+        """Open a child span for normalized TOOL_CALL events.
 
-                if tool_id:
-                    run.pending_tools[tool_id] = _ToolEntry(
-                        span=child, tool_name=tool_name, tool_input=tool_input,
-                    )
+        Claude emits both full assistant turns and lower-level stream events, so
+        ``_open_tool`` de-duplicates by tool id. Codex and Pi only expose this
+        normalized lifecycle, which is why handling TOOL_CALL here is required
+        for runner-neutral traces.
+        """
+        data = event.data
+        tool_id = _first_string(data, "tool_id", "call_id", "id")
+        item = data.get("item")
+        if not tool_id and isinstance(item, dict):
+            tool_id = _first_string(item, "tool_id", "call_id", "id")
+
+        tool_name = _first_string(data, "tool_name", "name", "command") or "unknown"
+        tool_input = _extract_tool_input(data)
+        intent = " | ".join(run.pending_intent) if run.pending_intent else None
+        if intent and len(intent) > _MAX_INTENT_CHARS:
+            intent = intent[:_MAX_INTENT_CHARS] + "..."
+        run.pending_intent.clear()
+        self._open_tool(run, tool_id, tool_name, tool_input, intent)
+
+    def _open_tool(
+        self,
+        run: _RunState,
+        tool_id: str | None,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        intent: str | None,
+    ) -> None:
+        """Open one tool span, de-duplicating mixed high/low-level events."""
+        if tool_id and tool_id in run.pending_tools:
+            existing = run.pending_tools[tool_id]
+            if tool_input and not existing.tool_input:
+                existing.tool_input = tool_input
+                existing.span.log(input=tool_input)
+            return
+
+        detail = _extract_detail(tool_name, tool_input)
+        span_name = f"{tool_name}: {detail}" if detail else tool_name
+        span_type = "function" if tool_name == "Skill" else "tool"
+        child = run.span.start_span(
+            name=span_name,
+            type=span_type,
+            input=tool_input,
+            metadata={"intent": intent} if intent else {},
+        )
+
+        run.total_tools += 1
+        run.tools_used[tool_name] = run.tools_used.get(tool_name, 0) + 1
+        if tool_name == "Skill":
+            run.skills.append(str(tool_input.get("skill", "")))
+
+        if tool_id:
+            run.pending_tools[tool_id] = _ToolEntry(
+                span=child,
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+        else:
+            # A span without a correlation id cannot receive a later result.
+            child.log(output="[tool call has no correlation id]")
+            child.end()
 
     def _handle_result(self, run: _RunState, event: AgentEvent) -> None:
         """Match tool results to pending child spans and close them."""
-        for block in event.data.get("tool_results", []):
+        for block in _extract_tool_results(event.data):
             tool_id = block.get("tool_use_id")
             entry = run.pending_tools.pop(tool_id, None)
             if not entry:
@@ -267,8 +319,14 @@ class BraintrustTracer:
             content = block.get("content", "")
             is_denial = False
 
-            if is_error and isinstance(content, str):
-                is_denial = any(p in content.lower() for p in _DENIAL_PATTERNS)
+            searchable_content = content
+            if not isinstance(searchable_content, str):
+                try:
+                    searchable_content = json.dumps(searchable_content, sort_keys=True)
+                except (TypeError, ValueError):
+                    searchable_content = str(searchable_content)
+            if is_error:
+                is_denial = any(p in searchable_content.lower() for p in _DENIAL_PATTERNS)
 
             if isinstance(content, str) and len(content) > _MAX_OUTPUT_CHARS:
                 content = content[:_MAX_OUTPUT_CHARS] + f"...[truncated {len(content) - _MAX_OUTPUT_CHARS} chars]"
@@ -284,6 +342,74 @@ class BraintrustTracer:
                 entry.span.log(scores={"denied": 1.0})
 
             entry.span.end()
+
+
+def _first_string(data: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _extract_tool_input(data: dict[str, Any]) -> dict[str, Any]:
+    for key in ("tool_input", "input", "arguments", "args"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            return value
+
+    item = data.get("item")
+    if isinstance(item, dict):
+        nested = _extract_tool_input(item)
+        if nested:
+            return nested
+
+    command = data.get("command")
+    if isinstance(command, str):
+        return {"command": command}
+    return {}
+
+
+def _extract_tool_results(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize Claude, Codex, and Pi result payloads."""
+    blocks = data.get("tool_results")
+    if isinstance(blocks, list):
+        return [block for block in blocks if isinstance(block, dict)]
+
+    item = data.get("item") if isinstance(data.get("item"), dict) else {}
+    tool_id = (
+        _first_string(data, "tool_use_id", "tool_id", "call_id", "id")
+        or _first_string(item, "tool_use_id", "tool_id", "call_id", "id")
+    )
+    if not tool_id:
+        return []
+
+    content: Any = ""
+    for source in (data, item):
+        for key in ("content", "output", "result", "aggregated_output", "message"):
+            value = source.get(key)
+            if value not in (None, ""):
+                content = value
+                break
+        if content not in (None, ""):
+            break
+
+    status = str(data.get("status") or item.get("status") or "").lower()
+    exit_code = data.get("exit_code", item.get("exit_code"))
+    is_error = bool(data.get("is_error") or item.get("is_error"))
+    is_error = is_error or status in {"error", "failed", "failure"}
+    is_error = is_error or (isinstance(exit_code, int) and exit_code != 0)
+    is_error = is_error or bool(data.get("error") or item.get("error"))
+    if content in (None, "") and (data.get("error") or item.get("error")):
+        content = data.get("error") or item.get("error")
+
+    return [
+        {
+            "tool_use_id": tool_id,
+            "content": content,
+            "is_error": is_error,
+        }
+    ]
 
 
 def _extract_detail(tool_name: str, tool_input: dict) -> str:
