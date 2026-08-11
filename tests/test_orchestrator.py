@@ -274,6 +274,18 @@ class TestPromptResolution:
 
 
 class TestRunnerResolution:
+    def test_model_defaults_are_runner_specific(self):
+        cfg = _make_config()
+        orch = _make_orchestrator(cfg)
+        state = cfg.states["implement"]
+
+        assert orch._resolve_runner_model(state, "claude") == cfg.claude.model
+        assert orch._resolve_runner_model(state, "codex") is None
+        assert orch._resolve_runner_model(state, "pi") is None
+
+        state.model = "mlx/local-model"
+        assert orch._resolve_runner_model(state, "pi") == "mlx/local-model"
+
     def test_default_runner_is_claude(self):
         cfg = _make_config()
         orch = _make_orchestrator(cfg)
