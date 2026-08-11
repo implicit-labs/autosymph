@@ -460,6 +460,14 @@ class Orchestrator:
             raise ConfigError(f"Runner '{runner_name}' is not registered")
         return runner_name
 
+    def _resolve_runner_model(self, state_cfg: StateConfig, runner_name: str) -> str | None:
+        """Use state pins for every runner and Claude's default only for Claude."""
+        if state_cfg.model:
+            return state_cfg.model
+        if runner_name == "claude":
+            return self.config.claude.model
+        return None
+
     # -- Agent lifecycle --
 
     async def _spawn_agent(
@@ -496,7 +504,7 @@ class Orchestrator:
 
         # Build runner config from state + claude defaults (state overrides global)
         runner_config = {
-            "model": state_cfg.model or self.config.claude.model,
+            "model": self._resolve_runner_model(state_cfg, runner_name),
             "permission_mode": state_cfg.permission_mode or self.config.claude.permission_mode,
             "max_turns": state_cfg.max_turns or self.config.claude.max_turns,
             # Metadata only used by the runner's session-start log.
