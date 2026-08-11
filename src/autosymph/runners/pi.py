@@ -100,11 +100,7 @@ class PiRunner(AgentRunner):
         duration = time.monotonic() - start
         exit_code = proc.returncode or 0
 
-        error_events = [e for e in events if e.type == EventType.ERROR]
-        stream_error = None
-        if error_events:
-            last = error_events[-1].data
-            stream_error = last.get("message") or last.get("error")
+        stream_error = self._stream_error(events)
 
         success = exit_code == 0 and not stream_error
         if not success and stderr_out:
@@ -207,7 +203,9 @@ class PiRunner(AgentRunner):
                 },
             )
 
-        if event_type == "auto_retry_end" and not data.get("success", False):
+        if event_type == "auto_retry_end":
+            if data.get("success", False):
+                return AgentEvent(type=EventType.COMPLETION, timestamp=now, data=data)
             return AgentEvent(
                 type=EventType.ERROR,
                 timestamp=now,
@@ -244,6 +242,18 @@ class PiRunner(AgentRunner):
         if data.get("usage"):
             return AgentEvent(type=EventType.TOKEN_USAGE, timestamp=now, data=data)
         return None
+
+    @staticmethod
+    def _stream_error(events: list[AgentEvent]) -> str | None:
+        """Return the final terminal stream error, allowing retries to recover."""
+        stream_error: str | None = None
+        for event in events:
+            if event.type == EventType.ERROR:
+                value = event.data.get("message") or event.data.get("error")
+                stream_error = str(value) if value else "Pi run failed"
+            elif event.type == EventType.COMPLETION:
+                stream_error = None
+        return stream_error
 
     async def _read_lines(self, stream: asyncio.StreamReader | None):
         if not stream:

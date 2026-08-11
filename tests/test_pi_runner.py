@@ -163,6 +163,36 @@ class TestPiParser:
         assert message_error.data["message"] == "Connection error."
         assert retry_error is not None
         assert retry_error.type == EventType.ERROR
+        assert runner._stream_error([message_error, retry_error]) == "Connection error."
+
+    def test_successful_retry_clears_transient_provider_error(self):
+        runner = PiRunner()
+        transient_error = runner.parse_event(
+            json.dumps(
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "stopReason": "error",
+                        "errorMessage": "Connection error.",
+                    },
+                }
+            )
+        )
+        recovered = runner.parse_event(
+            json.dumps(
+                {
+                    "type": "auto_retry_end",
+                    "success": True,
+                    "attempt": 1,
+                }
+            )
+        )
+
+        assert transient_error is not None
+        assert recovered is not None
+        assert recovered.type == EventType.COMPLETION
+        assert runner._stream_error([transient_error, recovered]) is None
 
     def test_current_token_usage(self):
         event = PiRunner().parse_event(
