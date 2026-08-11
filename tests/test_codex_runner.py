@@ -15,7 +15,8 @@ class TestCodexCommand:
         assert cmd == [
             "codex",
             "exec",
-            "--full-auto",
+            "--sandbox",
+            "workspace-write",
             "--json",
             "-m",
             "gpt-5.4-codex",
@@ -53,6 +54,21 @@ class TestCodexCommand:
 
 
 class TestCodexParser:
+    def test_current_thread_start_exposes_session_id(self):
+        runner = CodexRunner()
+        event = runner.parse_event(
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "019fef96-c1e9-7161-90c3-fdbd4930d029",
+                }
+            )
+        )
+
+        assert event is not None
+        assert event.type == EventType.SYSTEM
+        assert runner._session_id_from(event.data) == "019fef96-c1e9-7161-90c3-fdbd4930d029"
+
     def test_assistant_text_from_item_updated(self):
         line = json.dumps({"type": "item.updated", "item": {"type": "message", "text": "hello"}})
 
@@ -79,6 +95,69 @@ class TestCodexParser:
         assert done_event is not None
         assert done_event.type == EventType.COMPLETION
         assert done_event.data["usage"]["input_tokens"] == 3
+
+    def test_current_command_execution_lifecycle(self):
+        runner = CodexRunner()
+        start = runner.parse_event(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "id": "item_1",
+                        "type": "command_execution",
+                        "command": "/bin/zsh -lc pwd",
+                        "aggregated_output": "",
+                        "exit_code": None,
+                        "status": "in_progress",
+                    },
+                }
+            )
+        )
+        result = runner.parse_event(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_1",
+                        "type": "command_execution",
+                        "command": "/bin/zsh -lc pwd",
+                        "aggregated_output": "/tmp/repo\n",
+                        "exit_code": 0,
+                        "status": "completed",
+                    },
+                }
+            )
+        )
+
+        assert start is not None
+        assert start.type == EventType.TOOL_CALL
+        assert start.data["tool_name"] == "Bash"
+        assert start.data["tool_id"] == "item_1"
+        assert start.data["input"] == {"command": "/bin/zsh -lc pwd"}
+        assert result is not None
+        assert result.type == EventType.TOOL_RESULT
+        assert result.data["tool_id"] == "item_1"
+        assert result.data["content"] == "/tmp/repo\n"
+        assert result.data["is_error"] is False
+
+    def test_current_usage_keys_are_normalized(self):
+        usage = CodexRunner._normalize_usage(
+            {
+                "input_tokens": 120,
+                "cached_input_tokens": 80,
+                "cache_write_input_tokens": 5,
+                "output_tokens": 14,
+                "reasoning_output_tokens": 3,
+            }
+        )
+
+        assert usage == {
+            "input_tokens": 120,
+            "cache_read_input_tokens": 80,
+            "cache_creation_input_tokens": 5,
+            "output_tokens": 14,
+            "reasoning_output_tokens": 3,
+        }
 
     def test_failed_turn_is_error(self):
         event = CodexRunner().parse_event(

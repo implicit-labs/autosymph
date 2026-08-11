@@ -83,12 +83,25 @@ TRACE_CASES = [
         "input": {
             "runner": "codex",
             "lines": [
-                {"type": "exec_command.started", "id": "tool-1", "command": "pytest"},
                 {
-                    "type": "exec_command.completed",
-                    "id": "tool-1",
-                    "exit_code": 1,
-                    "output": "Permission denied by policy",
+                    "type": "item.started",
+                    "item": {
+                        "id": "tool-1",
+                        "type": "command_execution",
+                        "command": "pytest",
+                        "status": "in_progress",
+                    },
+                },
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "tool-1",
+                        "type": "command_execution",
+                        "command": "pytest",
+                        "aggregated_output": "Permission denied by policy",
+                        "exit_code": 1,
+                        "status": "failed",
+                    },
                 },
             ],
         },
@@ -141,12 +154,25 @@ TRACE_CASES = [
         "input": {
             "runner": "codex",
             "lines": [
-                {"type": "exec_command.started", "id": "tool-1", "command": "pytest"},
                 {
-                    "type": "exec_command.completed",
-                    "id": "tool-1",
-                    "exit_code": 0,
-                    "output": "12 passed",
+                    "type": "item.started",
+                    "item": {
+                        "id": "tool-1",
+                        "type": "command_execution",
+                        "command": "pytest",
+                        "status": "in_progress",
+                    },
+                },
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "tool-1",
+                        "type": "command_execution",
+                        "command": "pytest",
+                        "aggregated_output": "12 passed",
+                        "exit_code": 0,
+                        "status": "completed",
+                    },
                 },
             ],
         },
