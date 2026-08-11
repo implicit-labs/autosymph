@@ -113,7 +113,7 @@ class BraintrustTracer:
         if issue_id not in self._issue_spans:
             self._issue_spans[issue_id] = self._logger.start_span(
                 name=identifier,
-                type="task",
+                type=braintrust.SpanTypeAttribute.TASK,
                 metadata={"issue_id": issue_id, "identifier": identifier},
             )
             logger.debug("[bt] started issue span: %s", identifier)
@@ -283,7 +283,11 @@ class BraintrustTracer:
 
         detail = _extract_detail(tool_name, tool_input)
         span_name = f"{tool_name}: {detail}" if detail else tool_name
-        span_type = "function" if tool_name == "Skill" else "tool"
+        span_type = (
+            braintrust.SpanTypeAttribute.FUNCTION
+            if tool_name == "Skill"
+            else braintrust.SpanTypeAttribute.TOOL
+        )
         child = run.span.start_span(
             name=span_name,
             type=span_type,
@@ -311,6 +315,8 @@ class BraintrustTracer:
         """Match tool results to pending child spans and close them."""
         for block in _extract_tool_results(event.data):
             tool_id = block.get("tool_use_id")
+            if not isinstance(tool_id, str):
+                continue
             entry = run.pending_tools.pop(tool_id, None)
             if not entry:
                 continue
@@ -376,7 +382,8 @@ def _extract_tool_results(data: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(blocks, list):
         return [block for block in blocks if isinstance(block, dict)]
 
-    item = data.get("item") if isinstance(data.get("item"), dict) else {}
+    raw_item = data.get("item")
+    item: dict[str, Any] = raw_item if isinstance(raw_item, dict) else {}
     tool_id = (
         _first_string(data, "tool_use_id", "tool_id", "call_id", "id")
         or _first_string(item, "tool_use_id", "tool_id", "call_id", "id")

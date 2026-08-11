@@ -14,7 +14,6 @@ Output format (permission-denials.md):
 """
 
 import json
-import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
