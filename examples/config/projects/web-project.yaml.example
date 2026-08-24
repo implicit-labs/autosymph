@@ -24,6 +24,11 @@ linear_states:
 workspace:
   root: ~/.autosymph/workspaces
 
+reliability:
+  mode: observe
+  backup_before_migrate: true
+  recover_read_only: true
+
 hooks:
   before_run: |
     git fetch origin main
@@ -97,4 +102,3 @@ states:
   done:
     type: terminal
     linear_state: terminal
-

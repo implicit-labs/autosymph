@@ -78,6 +78,7 @@ def _make_orchestrator(config: WorkflowConfig):
     from unittest.mock import MagicMock
 
     from autosymph.orchestrator import Orchestrator
+    from autosymph.ledger import SQLiteLedger
     from autosymph.state_machine import StateMachine
 
     linear = MagicMock()
@@ -90,6 +91,7 @@ def _make_orchestrator(config: WorkflowConfig):
         linear=linear,
         state_machine=StateMachine(config),
         workspace_mgr=workspace_mgr,
+        ledger=SQLiteLedger(":memory:"),
     )
 
 

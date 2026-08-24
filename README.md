@@ -276,6 +276,8 @@ uv run autosymph start --max-agents 4     # cap global concurrency
 uv run autosymph config check config.yaml # validate one project config
 uv run autosymph status                   # query the local status API
 uv run autosymph logs ISSUE-123           # show logs for an issue
+uv run autosymph ledger check             # verify the durable local ledger
+uv run autosymph ledger export --output ledger.jsonl
 uv run autosymph models check             # detect stale pinned model ids
 uv run autosymph models refresh           # inspect model registry changes
 ```
@@ -316,6 +318,7 @@ autosymph writes local state under `~/.autosymph/` by default:
 ```text
 ~/.autosymph/
   logs/
+    factory.sqlite3
     {project-slug}/{issue-slug}/{state}-run{N}.ndjson
     {project-slug}/{issue-slug}/{state}-run{N}.meta.json
   workspaces/
@@ -325,6 +328,26 @@ autosymph writes local state under `~/.autosymph/` by default:
 
 Raw `.ndjson` logs are intentionally kept because monitor and audit skills use
 them to reconstruct what an agent actually did.
+
+`factory.sqlite3` is the crash-safe source of truth for run allocation,
+terminal outcomes, transition decisions, and later repair receipts. Raw log
+contents stay in NDJSON; the ledger stores only their path, byte size, and
+SHA-256 digest. Remote tracing is optional and cannot determine whether a run
+was durably recorded.
+
+The reliability rollout is configured per project:
+
+```yaml
+reliability:
+  mode: observe # observe | enforce_verify | enforce_all
+  # database_path: ~/.autosymph/state/autosymph.db
+  backup_before_migrate: true
+  recover_read_only: true
+```
+
+Use `autosymph ledger check` for an integrity check. Use `autosymph ledger
+export --output ledger.jsonl` for a manifest-prefixed, redacted audit export;
+add `--format parquet` when the optional `parquet` dependency is installed.
 
 ## Optional Verification Tooling
 
@@ -379,4 +402,3 @@ source code with either upstream project.
 ## License
 
 autosymph is released under the [MIT License](LICENSE).
-

@@ -13,6 +13,8 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from autosymph.ledger import redact_payload
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +58,7 @@ class LogStream:
         session_id: str | None,
         error: str | None,
         runner: str = "claude",
+        run_id: str | None = None,
     ) -> Path:
         """Write a summary meta file alongside the NDJSON log."""
         meta_path = path.with_suffix(".meta.json")
@@ -69,10 +72,11 @@ class LogStream:
             "token_usage": token_usage,
             "session_id": session_id,
             "runner": runner,
+            "run_id": run_id,
             "error": error,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
-        meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+        meta_path.write_text(json.dumps(redact_payload(meta), indent=2) + "\n")
         return meta_path
 
     def count_runs(self, issue_id: str, state: str) -> int:

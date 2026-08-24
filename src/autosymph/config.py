@@ -47,6 +47,24 @@ class LoggingConfig(BaseModel):
         return Path(self.log_root).expanduser().resolve()
 
 
+class ReliabilityConfig(BaseModel):
+    """Crash-safe local reliability ledger and enforcement rollout."""
+
+    mode: Literal["observe", "enforce_verify", "enforce_all"] = "observe"
+    database_path: str | None = None
+    export_root: str = "~/.autosymph/exports"
+    backup_before_migrate: bool = True
+    recover_read_only: bool = True
+
+    def resolved_database_path(self, log_root: Path) -> Path:
+        if self.database_path:
+            return Path(self.database_path).expanduser().resolve()
+        return log_root / "factory.sqlite3"
+
+    def resolved_export_root(self) -> Path:
+        return Path(self.export_root).expanduser().resolve()
+
+
 class WorkspaceConfig(BaseModel):
     root: str = "~/.autosymph/workspaces"
     repo: str = "."  # path to the git repo that worktrees are created from
@@ -207,6 +225,7 @@ class WorkflowConfig(BaseModel):
     polling: PollingConfig = Field(default_factory=PollingConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     hooks: HooksConfig = Field(default_factory=HooksConfig)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
@@ -274,6 +293,7 @@ class DeviceConfig(BaseModel):
     resources: ResourcesConfig = Field(default_factory=ResourcesConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     projects: dict[str, DeviceProjectOverride] = Field(default_factory=dict)
 
@@ -319,6 +339,8 @@ def merge_device_project(
         merged_data["agent"] = device.agent.model_dump()
     if "logging" in device.model_fields_set:
         merged_data["logging"] = device.logging.model_dump()
+    if "reliability" in device.model_fields_set:
+        merged_data["reliability"] = device.reliability.model_dump()
     if "claude" in device.model_fields_set:
         merged_data["claude"] = device.claude.model_dump()
 
