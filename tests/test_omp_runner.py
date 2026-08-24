@@ -16,7 +16,7 @@ def test_command_contains_profile_not_secret(tmp_path):
     command = OmpRunner()._build_command(
         prompt,
         {
-            "model": "anthropic/claude-sonnet",
+            "model": "anthropic/claude-sonnet-5",
             "profile": "claude-api",
             "permission_mode": "write",
             "max_time_seconds": 60,
@@ -58,6 +58,25 @@ def test_parser_handles_tool_and_completion_events():
     assert tool is not None and tool.type == EventType.TOOL_CALL
     assert tool.data["tool_name"] == "bash"
     assert done is not None and done.type == EventType.COMPLETION
+
+
+def test_parser_treats_nested_omp_model_error_as_failure_event():
+    event = OmpRunner().parse_event(
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorStatus": 404,
+                    "errorMessage": "model not found",
+                },
+            }
+        )
+    )
+
+    assert event is not None and event.type == EventType.ERROR
+    assert event.data["message"] == "model not found"
 
 
 def test_prompt_must_be_workspace_local(tmp_path):

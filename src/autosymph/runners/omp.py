@@ -174,6 +174,19 @@ class OmpRunner(AgentRunner):
         now = datetime.now(timezone.utc)
         event_type = str(data.get("type") or data.get("event") or "")
 
+        nested_message = data.get("message")
+        error_payload = nested_message if isinstance(nested_message, dict) else data
+        if (
+            error_payload.get("stopReason") == "error"
+            or error_payload.get("errorMessage")
+            or error_payload.get("errorStatus")
+        ):
+            return AgentEvent(
+                type=EventType.ERROR,
+                timestamp=now,
+                data={**data, "message": self._error_message(error_payload)},
+            )
+
         if event_type in {"error", "agent_error", "auto_retry_end"}:
             if event_type != "auto_retry_end" or data.get("success") is False or data.get("error"):
                 return AgentEvent(
@@ -245,7 +258,7 @@ class OmpRunner(AgentRunner):
 
     @staticmethod
     def _error_message(data: dict[str, Any]) -> str:
-        for key in ("message", "error", "reason"):
+        for key in ("errorMessage", "message", "error", "reason"):
             value = data.get(key)
             if isinstance(value, str) and value:
                 return value

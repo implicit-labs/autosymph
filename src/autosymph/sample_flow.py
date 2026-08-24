@@ -38,7 +38,7 @@ SAMPLE_PROFILES: dict[str, RunnerDefinition] = {
     ),
     "omp-subscription": RunnerDefinition(
         type="omp",
-        model="anthropic/claude-sonnet",
+        model="anthropic/claude-sonnet-5",
         auth_mode="stored_profile",
         profile="autosymph-subscription",
         permission_mode="write",
@@ -46,7 +46,7 @@ SAMPLE_PROFILES: dict[str, RunnerDefinition] = {
     ),
     "omp-claude-api": RunnerDefinition(
         type="omp",
-        model="anthropic/claude-sonnet",
+        model="anthropic/claude-sonnet-5",
         auth_mode="environment",
         auth_env="ANTHROPIC_API_KEY",
         profile="autosymph-claude-api",
