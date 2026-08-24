@@ -12,6 +12,7 @@ import click
 import yaml  # type: ignore[import-untyped]
 
 from autosymph.config import RunnersConfig, TrackerConfig
+from autosymph.contract_flow import ValueContract, run_contract_flow_sync
 from autosymph.factory import FactoryRepository, findings_as_json
 from autosymph.receipts import write_json_atomic
 from autosymph.sample_flow import SAMPLE_PROFILES, run_sample_flow_sync
@@ -257,3 +258,53 @@ def sample_factory(runner_profile: str) -> None:
     )
     if not result.success:
         raise click.ClickException("compiled factory sample did not reach done")
+
+
+@factory.command("run")
+@click.argument("root", type=click.Path(path_type=Path, file_okay=False, exists=True))
+@click.option(
+    "--workspace",
+    type=click.Path(path_type=Path, file_okay=False, exists=True),
+    required=True,
+)
+@click.option(
+    "--contract",
+    "contract_path",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    required=True,
+)
+@click.option(
+    "--runner",
+    "runner_profile",
+    type=click.Choice(list(SAMPLE_PROFILES)),
+    default="codex",
+    show_default=True,
+)
+def run_factory(
+    root: Path,
+    workspace: Path,
+    contract_path: Path,
+    runner_profile: str,
+) -> None:
+    """Run an audited factory against a clean real Git workspace contract."""
+    try:
+        repository = FactoryRepository(root)
+        workflow = repository.compile_workflow(
+            tracker=TrackerConfig(project="local-contract", api_key="unused"),
+            runners=_runner_config(runner_profile),
+        )
+        contract = ValueContract.load(contract_path)
+        result = run_contract_flow_sync(
+            factory=repository,
+            workflow=workflow,
+            contract=contract,
+            workspace=workspace,
+            runner_profile=runner_profile,
+        )
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    if not result.success:
+        raise click.ClickException(
+            "contract factory did not reach done: " + ", ".join(result.gate_reasons)
+        )
