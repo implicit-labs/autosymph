@@ -112,7 +112,7 @@ class BraintrustTracer:
         if issue_id not in self._issue_spans:
             self._issue_spans[issue_id] = self._logger.start_span(
                 name=identifier,
-                type="task",
+                type=braintrust.SpanTypeAttribute.TASK,
                 metadata={"issue_id": issue_id, "identifier": identifier},
             )
             logger.debug("[bt] started issue span: %s", identifier)
@@ -121,7 +121,7 @@ class BraintrustTracer:
         name = f"{state}-run{run_number}"
         span = parent.start_span(
             name=name,
-            type="task",
+            type=braintrust.SpanTypeAttribute.TASK,
             input=prompt,
             metadata={
                 "issue_id": issue_id,
