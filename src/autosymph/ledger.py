@@ -141,6 +141,18 @@ class Ledger(Protocol):
         signal: str,
     ) -> EventRecord: ...
 
+    def commit_run_transition(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        status: str,
+        from_state: str,
+        to_state: str | None,
+        signal: str,
+        payload: dict[str, Any] | None = None,
+    ) -> EventRecord: ...
+
     def reconcile_open_runs(self, *, project_slug: str | None = None) -> list[str]: ...
 
     def close(self) -> None: ...
@@ -159,6 +171,7 @@ _SAFE_SENSITIVE_SUFFIXES = (
     "_sha",
     "_sha256",
     "_hash",
+    "_usage",
 )
 _TOKEN_PATTERNS = (
     re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}\b"),
@@ -168,6 +181,10 @@ _TOKEN_PATTERNS = (
     re.compile(
         r"(?i)\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)"
         r"[A-Z0-9_]*=)[^\s]+"
+    ),
+    re.compile(
+        r"(?i)\b((?:api[_-]?key|token|secret|password|credential)\s*[=:]\s*)"
+        r"[^\s,;]+"
     ),
 )
 
@@ -878,6 +895,102 @@ class SQLiteLedger:
             payload=payload,
         )
 
+    def commit_run_transition(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        status: str,
+        from_state: str,
+        to_state: str | None,
+        signal: str,
+        payload: dict[str, Any] | None = None,
+    ) -> EventRecord:
+        """Atomically commit terminal run state, its event, and routing decision."""
+        process_outcome = {
+            "completed": "succeeded",
+            "failed": "failed",
+            "crashed": "failed",
+            "preflight_blocked": "failed",
+            "cancelled": "cancelled",
+            "timed_out": "timed_out",
+            "interrupted": "interrupted",
+            "provider_error": "provider_error",
+        }.get(status, "failed")
+        semantic_outcome = (
+            "completion_candidate" if status == "completed" else "completion_rejected"
+        )
+        decision_id = _uuid7()
+        decision = {
+            "decision_id": decision_id,
+            "signal": signal,
+            "from_state": from_state,
+            "to_state": to_state,
+        }
+        with self.transaction() as conn:
+            run = self._require_run(conn, run_id)
+            if run["terminal_event_id"]:
+                existing = conn.execute(
+                    "SELECT * FROM events WHERE event_id = ?", (run["terminal_event_id"],)
+                ).fetchone()
+                if existing is None:
+                    raise LedgerIntegrityError(
+                        f"Run {run_id} references missing terminal event"
+                    )
+                return EventRecord(
+                    existing["event_id"],
+                    existing["run_id"],
+                    existing["event_type"],
+                    existing["occurred_at"],
+                    existing["payload_sha256"],
+                )
+
+            event = self._append_event(
+                conn,
+                event_type=event_type,
+                project_slug=run["project_slug"],
+                issue_id=run["issue_id"],
+                issue_identifier=run["issue_identifier"],
+                run_id=run_id,
+                producer="autosymph:orchestrator:v1",
+                payload={**(payload or {}), "transition": decision},
+                idempotency_key=f"run-terminal:{run_id}",
+            )
+            conn.execute(
+                """
+                INSERT INTO transition_decisions(
+                    decision_id, run_id, from_state, to_state, accepted,
+                    reason_code, decision_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    run_id,
+                    from_state,
+                    to_state,
+                    1 if to_state else 0,
+                    signal,
+                    _canonical_json(decision),
+                    event.occurred_at,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE runs SET status = ?, process_outcome = ?, semantic_outcome = ?,
+                    completed_at = ?, terminal_event_id = ?
+                WHERE run_id = ?
+                """,
+                (
+                    "completed" if status == "completed" else status,
+                    process_outcome,
+                    semantic_outcome,
+                    event.occurred_at,
+                    event.event_id,
+                    run_id,
+                ),
+            )
+            return event
+
     def attach_raw_log(self, run_id: str, path: Path) -> None:
         """Attach raw NDJSON by path, digest, and byte size."""
         resolved = path.expanduser().resolve()
@@ -1080,8 +1193,8 @@ class SQLiteLedger:
     ) -> ExportManifest:
         """Export the append-only event stream to Parquet with a JSON manifest."""
         try:
-            import pyarrow as pa  # type: ignore[import-not-found]
-            import pyarrow.parquet as pq  # type: ignore[import-not-found]
+            import pyarrow as pa  # type: ignore[import-not-found,import-untyped]
+            import pyarrow.parquet as pq  # type: ignore[import-not-found,import-untyped]
         except ImportError as exc:  # pragma: no cover - depends on optional extra
             raise LedgerError(
                 "Parquet export requires the optional 'parquet' dependency"

@@ -744,6 +744,21 @@ class Orchestrator:
             )
 
             def on_event(event):
+                # Braintrust only sees events after the local durability
+                # boundary accepts their lifecycle envelope. Large raw tool
+                # payloads stay in NDJSON rather than becoming SQLite blobs.
+                self.ledger.append_event(
+                    run_id=run_id,
+                    project_slug=self.project_slug,
+                    issue_id=issue.id,
+                    issue_identifier=issue.identifier,
+                    event_type="agent_event_committed",
+                    producer=f"autosymph:runner:{runner_name}",
+                    payload={
+                        "agent_event_type": event.type.value,
+                        "data_keys": sorted(str(key) for key in event.data),
+                    },
+                )
                 self.mark_activity(issue.id)
                 timeline.ingest(event)
                 # Activity summarizer — fail-soft. Any exception sets `errored`,
@@ -846,18 +861,25 @@ class Orchestrator:
                     issue.identifier, workflow_state, run_number, result.error,
                 )
 
-            self.ledger.record_terminal(
+            terminal_event_type = "run_completed" if result.success else "run_failed"
+            terminal_status = "completed" if result.success else "failed"
+            terminal_payload = {
+                "exit_code": result.exit_code,
+                "duration_seconds": result.duration_seconds,
+                "token_usage": result.token_usage,
+                "session_id": result.session_id,
+                "runner": runner_name,
+                "error": result.error,
+            }
+            failed = not result.success
+            await self.on_agent_complete(
+                issue.id,
+                result.success,
+                issue,
                 run_id=run_id,
-                event_type="run_completed" if result.success else "run_failed",
-                status="completed" if result.success else "failed",
-                payload={
-                    "exit_code": result.exit_code,
-                    "duration_seconds": result.duration_seconds,
-                    "token_usage": result.token_usage,
-                    "session_id": result.session_id,
-                    "runner": runner_name,
-                    "error": result.error,
-                },
+                terminal_event_type=terminal_event_type,
+                terminal_status=terminal_status,
+                terminal_payload=terminal_payload,
             )
 
             # Post summary comment to Linear (activity summary preferred, timeline fallback)
@@ -872,9 +894,6 @@ class Orchestrator:
                 timeline,
                 summarizer,
             )
-
-            failed = not result.success
-            await self.on_agent_complete(issue.id, result.success, issue, run_id=run_id)
 
         except asyncio.CancelledError:
             logger.info("[%s] cancelled", session_name)
@@ -1107,6 +1126,9 @@ class Orchestrator:
         issue: LinearIssue | None = None,
         *,
         run_id: str | None = None,
+        terminal_event_type: str | None = None,
+        terminal_status: str | None = None,
+        terminal_payload: dict[str, Any] | None = None,
     ) -> None:
         """Handle agent completion — transition state, clean up."""
         agent = self._running.pop(issue_id, None)
@@ -1114,6 +1136,13 @@ class Orchestrator:
             await self._concurrency_mgr.release(self.project_slug)
         tracked = self.sm.get_issue(issue_id)
         if not tracked:
+            if run_id and terminal_event_type and terminal_status:
+                self.ledger.record_terminal(
+                    run_id=run_id,
+                    event_type=terminal_event_type,
+                    status=terminal_status,
+                    payload=terminal_payload,
+                )
             return
 
         if success:
@@ -1168,12 +1197,23 @@ class Orchestrator:
                 )
                 self.event_log.state_change(tracked.identifier, tracked.workflow_state, target)
                 if run_id:
-                    self.ledger.record_transition(
-                        run_id=run_id,
-                        from_state=tracked.workflow_state,
-                        to_state=target,
-                        signal=signal_to_use.value,
-                    )
+                    if terminal_event_type and terminal_status:
+                        self.ledger.commit_run_transition(
+                            run_id=run_id,
+                            event_type=terminal_event_type,
+                            status=terminal_status,
+                            from_state=tracked.workflow_state,
+                            to_state=target,
+                            signal=signal_to_use.value,
+                            payload=terminal_payload,
+                        )
+                    else:
+                        self.ledger.record_transition(
+                            run_id=run_id,
+                            from_state=tracked.workflow_state,
+                            to_state=target,
+                            signal=signal_to_use.value,
+                        )
                 # Transition in Linear
                 target_cfg = self.config.states.get(target)
                 if target_cfg and target_cfg.linear_state:
@@ -1193,6 +1233,16 @@ class Orchestrator:
                     tracked.workflow_state = target
                     self.sm.release(issue_id)
             else:
+                if run_id and terminal_event_type and terminal_status:
+                    self.ledger.commit_run_transition(
+                        run_id=run_id,
+                        event_type=terminal_event_type,
+                        status=terminal_status,
+                        from_state=tracked.workflow_state,
+                        to_state=None,
+                        signal=signal_to_use.value,
+                        payload=terminal_payload,
+                    )
                 logger.error(
                     "%s completed but no valid transition from '%s' (signal=%s) — untracking",
                     tracked.identifier, tracked.workflow_state, signal_to_use.value,
@@ -1218,6 +1268,16 @@ class Orchestrator:
                         self.event_log.state_change(
                             tracked.identifier, tracked.workflow_state, "blocked",
                         )
+                        if run_id and terminal_event_type and terminal_status:
+                            self.ledger.commit_run_transition(
+                                run_id=run_id,
+                                event_type=terminal_event_type,
+                                status=terminal_status,
+                                from_state=tracked.workflow_state,
+                                to_state="blocked",
+                                signal="verify_retry_exhausted",
+                                payload=terminal_payload,
+                            )
                         blocked_status = self._workflow_to_linear_status("blocked")
                         if blocked_status:
                             try:
@@ -1240,15 +1300,36 @@ class Orchestrator:
                     tracked.identifier, tracked.workflow_state, target,
                 )
                 if run_id:
-                    self.ledger.record_transition(
-                        run_id=run_id,
-                        from_state=tracked.workflow_state,
-                        to_state=target,
-                        signal=Signal.FAIL.value,
-                    )
+                    if terminal_event_type and terminal_status:
+                        self.ledger.commit_run_transition(
+                            run_id=run_id,
+                            event_type=terminal_event_type,
+                            status=terminal_status,
+                            from_state=tracked.workflow_state,
+                            to_state=target,
+                            signal=Signal.FAIL.value,
+                            payload=terminal_payload,
+                        )
+                    else:
+                        self.ledger.record_transition(
+                            run_id=run_id,
+                            from_state=tracked.workflow_state,
+                            to_state=target,
+                            signal=Signal.FAIL.value,
+                        )
                 tracked.workflow_state = target
                 self.sm.release(issue_id)
             else:
+                if run_id and terminal_event_type and terminal_status:
+                    self.ledger.commit_run_transition(
+                        run_id=run_id,
+                        event_type=terminal_event_type,
+                        status=terminal_status,
+                        from_state=tracked.workflow_state,
+                        to_state=None,
+                        signal=Signal.FAIL.value,
+                        payload=terminal_payload,
+                    )
                 self._failed_today.append(tracked.identifier)
                 self._notify_status_change()
                 logger.error(

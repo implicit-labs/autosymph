@@ -18,6 +18,7 @@ from autosymph.ledger import (
     LedgerMigrationError,
     SQLiteLedger,
 )
+from autosymph.logging.stream import LogStream
 
 
 def _allocate(ledger: SQLiteLedger, *, state: str = "implement"):
@@ -161,6 +162,38 @@ def test_transition_decision_and_event_are_idempotent(tmp_path: Path) -> None:
     assert decision_count == 1
 
 
+def test_terminal_run_event_and_transition_roll_back_together(tmp_path: Path) -> None:
+    with SQLiteLedger(tmp_path / "ledger.db") as ledger:
+        run = _allocate(ledger)
+        ledger._connection.execute(
+            """
+            CREATE TRIGGER reject_decision BEFORE INSERT ON transition_decisions
+            BEGIN SELECT RAISE(ABORT, 'simulated decision crash'); END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="simulated decision crash"):
+            ledger.commit_run_transition(
+                run_id=run.run_id,
+                event_type="run_completed",
+                status="completed",
+                from_state="implement",
+                to_state="verify",
+                signal="complete",
+            )
+
+        stored = ledger.get_run(run.run_id)
+        terminal_count = ledger._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE idempotency_key = ?",
+            (f"run-terminal:{run.run_id}",),
+        ).fetchone()[0]
+
+    assert stored is not None
+    assert stored["status"] == "allocated"
+    assert stored["terminal_event_id"] is None
+    assert terminal_count == 0
+
+
 def test_raw_log_is_stored_by_path_hash_and_size(tmp_path: Path) -> None:
     raw_log = tmp_path / "run.ndjson"
     raw_log.write_text('{"type":"assistant"}\n', encoding="utf-8")
@@ -178,8 +211,8 @@ def test_raw_log_is_stored_by_path_hash_and_size(tmp_path: Path) -> None:
 def test_existing_database_is_backed_up_before_migration(tmp_path: Path) -> None:
     path = tmp_path / "ledger.db"
     connection = sqlite3.connect(path)
-    connection.execute("CREATE TABLE legacy_fixture(value TEXT)")
-    connection.execute("INSERT INTO legacy_fixture VALUES ('preserve-me')")
+    fixture = Path(__file__).parent / "fixtures" / "migrations" / "v0.sql"
+    connection.executescript(fixture.read_text(encoding="utf-8"))
     connection.commit()
     connection.close()
 
@@ -235,3 +268,49 @@ def test_jsonl_export_manifest_counts_hash_and_redacts_secrets(tmp_path: Path) -
     assert hashlib.sha256(exported_body.encode()).hexdigest() == manifest.content_sha256
     assert secret not in output.read_text(encoding="utf-8")
     assert "[REDACTED]" in output.read_text(encoding="utf-8")
+
+
+def test_log_metadata_redacts_secret_bearing_errors(tmp_path: Path) -> None:
+    stream = LogStream(tmp_path)
+    path = stream.open("imp-552", "implement", 1)
+    meta_path = stream.write_meta(
+        path,
+        issue_id="IMP-552",
+        state="implement",
+        run_number=1,
+        success=False,
+        exit_code=1,
+        duration_seconds=0.1,
+        token_usage={},
+        session_id=None,
+        error="provider failed password=hunter2 api_key=topsecret",
+    )
+
+    content = meta_path.read_text(encoding="utf-8")
+    assert "hunter2" not in content
+    assert "topsecret" not in content
+    assert content.count("[REDACTED]") == 2
+
+
+def test_parquet_export_manifest_and_redaction(tmp_path: Path) -> None:
+    pyarrow = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as parquet
+
+    output = tmp_path / "events.parquet"
+    with SQLiteLedger(tmp_path / "ledger.db") as ledger:
+        run = _allocate(ledger)
+        ledger.append_event(
+            event_type="provider_observed",
+            project_slug="autosymph",
+            issue_id="linear-1",
+            run_id=run.run_id,
+            payload={"password": "must-not-export"},
+        )
+        manifest = ledger.export_parquet(output)
+
+    table = parquet.read_table(output)
+    assert pyarrow is not None
+    assert manifest.schema_version == SCHEMA_VERSION
+    assert manifest.row_counts == {"events": 2}
+    assert manifest.content_sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert "must-not-export" not in json.dumps(table.to_pylist())

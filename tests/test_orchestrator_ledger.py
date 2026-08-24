@@ -18,6 +18,7 @@ from autosymph.config import (
 )
 from autosymph.ledger import SQLiteLedger
 from autosymph.linear_client import LinearIssue
+from autosymph.logging.braintrust import AsyncBraintrustProjector
 from autosymph.orchestrator import Orchestrator
 from autosymph.resources import AcquiredResources
 from autosymph.state_machine import StateMachine
@@ -145,13 +146,47 @@ async def test_workspace_crash_is_terminal_and_keeps_raw_attempt(tmp_path: Path)
     ledger.close()
 
 
+@pytest.mark.asyncio
+async def test_completion_commits_run_event_and_transition_together(tmp_path: Path) -> None:
+    orchestrator, _workspace, ledger, issue = _orchestrator(tmp_path, _ResourcePool())
+    run = ledger.allocate_run(
+        project_slug="autosymph",
+        issue_id=issue.id,
+        issue_identifier=issue.identifier,
+        state="implement",
+        runner="claude",
+    )
+
+    await orchestrator.on_agent_complete(
+        issue.id,
+        True,
+        issue,
+        run_id=run.run_id,
+        terminal_event_type="run_completed",
+        terminal_status="completed",
+        terminal_payload={"exit_code": 0},
+    )
+
+    stored = ledger.get_run(run.run_id)
+    decision = ledger._connection.execute(
+        "SELECT * FROM transition_decisions WHERE run_id = ?", (run.run_id,)
+    ).fetchone()
+    assert stored["status"] == "completed"
+    assert stored["terminal_event_id"] is not None
+    assert decision["from_state"] == "implement"
+    assert decision["to_state"] == "done"
+    ledger.close()
+
+
 def test_braintrust_failure_is_fail_soft(tmp_path: Path) -> None:
     orchestrator, _workspace, ledger, _issue = _orchestrator(tmp_path, _ResourcePool())
     tracer = MagicMock()
     tracer.on_event.side_effect = RuntimeError("provider offline")
-    orchestrator.tracer = tracer
+    projector = AsyncBraintrustProjector(tracer)
+    orchestrator.tracer = projector
 
     orchestrator._trace_call("on_event", "linear-1", object())
+    projector.close()
     run = ledger.allocate_run(
         project_slug="autosymph",
         issue_id="linear-1",
@@ -160,7 +195,8 @@ def test_braintrust_failure_is_fail_soft(tmp_path: Path) -> None:
         runner="claude",
     )
 
-    assert orchestrator.tracer is None
+    orchestrator.status_summary()
+    assert isinstance(projector.failure, RuntimeError)
     assert run.attempt_number == 1
     assert any("Braintrust projection failed" in warning for warning in orchestrator._warnings)
     ledger.close()

@@ -13,6 +13,8 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from autosymph.ledger import redact_payload
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,7 +76,7 @@ class LogStream:
             "error": error,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
-        meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+        meta_path.write_text(json.dumps(redact_payload(meta), indent=2) + "\n")
         return meta_path
 
     def count_runs(self, issue_id: str, state: str) -> int:
