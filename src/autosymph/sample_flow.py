@@ -8,7 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Any
+from typing import Any, Callable
 
 from autosymph.config import (
     RunnerDefinition,
@@ -132,6 +132,9 @@ async def run_sample_flow(
     runner_profile: str = "claude-code",
     workspace: Path | None = None,
     runner_registry: dict[str, AgentRunner] | None = None,
+    workflow: WorkflowConfig | None = None,
+    prompt_prefix: str | None = None,
+    extra_checks: Callable[[Path], list[dict[str, Any]]] | None = None,
 ) -> SampleFlowResult:
     if runner_profile not in SAMPLE_PROFILES:
         raise ValueError(
@@ -142,16 +145,17 @@ async def run_sample_flow(
         raise ValueError(f"sample workspace must be empty: {target}")
     base_sha = _initialize_workspace(target)
     profile = SAMPLE_PROFILES[runner_profile]
-    workflow = _workflow(runner_profile, profile)
-    state_machine = StateMachine(workflow)
+    runtime_workflow = workflow or _workflow(runner_profile, profile)
+    state_machine = StateMachine(runtime_workflow)
     tracked = state_machine.track_issue("local-sample", "LOCAL-SAMPLE", "implement")
     states = [tracked.workflow_state]
 
-    prompt = (
+    task_prompt = (
         "This is an autosymph sample implementation state. Edit sample.txt so its entire "
         "contents are exactly: autosymph sample complete followed by one newline. "
         "Do not modify any other file. Do not commit. Inspect the result before finishing."
     )
+    prompt = f"{prompt_prefix.rstrip()}\n\n{task_prompt}" if prompt_prefix else task_prompt
     evidence_dir = target / ".autosymph" / "evidence"
     raw_log = evidence_dir / "implement-run1.ndjson"
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -211,32 +215,50 @@ async def run_sample_flow(
     changed_files = set(_git(target, "diff", "--name-only").splitlines())
     scope_ok = changed_files == {"sample.txt"}
     proof_path = evidence_dir / "proof.json"
+    checks = [
+        {
+            "name": "exact-content",
+            "passed": content_ok,
+            "artifact_path": "sample.txt",
+            "artifact_sha256": sha256(subject.read_bytes()).hexdigest() if subject.is_file() else "",
+        },
+        {
+            "name": "change-scope",
+            "passed": scope_ok,
+            "artifact_path": "sample.txt",
+            "artifact_sha256": sha256(subject.read_bytes()).hexdigest() if subject.is_file() else "",
+        },
+    ]
+    if extra_checks:
+        try:
+            checks.extend(extra_checks(target))
+        except Exception as error:
+            extra_check_error = evidence_dir / "extra-check-error.json"
+            write_json_atomic(
+                extra_check_error,
+                {"error_type": error.__class__.__name__, "message": str(error)},
+            )
+            checks.append(
+                {
+                    "name": "extra-check-execution",
+                    "passed": False,
+                    "artifact_path": str(extra_check_error.relative_to(target)),
+                    "artifact_sha256": sha256(extra_check_error.read_bytes()).hexdigest(),
+                }
+            )
     proof = {
         "schema_version": 1,
         "attempt_id": receipt.attempt_id,
         "validator_id": "deterministic:sample-contract-v1",
         "subject_sha256": receipt.subject_sha256,
-        "checks": [
-            {
-                "name": "exact-content",
-                "passed": content_ok,
-                "artifact_path": "sample.txt",
-                "artifact_sha256": sha256(subject.read_bytes()).hexdigest() if subject.is_file() else "",
-            },
-            {
-                "name": "change-scope",
-                "passed": scope_ok,
-                "artifact_path": "sample.txt",
-                "artifact_sha256": sha256(subject.read_bytes()).hexdigest() if subject.is_file() else "",
-            },
-        ],
+        "checks": checks,
     }
     write_json_atomic(proof_path, proof)
     gate = evaluate_proof(
         receipt,
         proof_path,
         workspace=target,
-        required_checks={"exact-content", "change-scope"},
+        required_checks={str(check["name"]) for check in checks},
     )
     final_target = state_machine.next_state(
         "verify", Signal.APPROVE if gate.allowed else Signal.FAIL, "local-sample"
@@ -259,5 +281,16 @@ async def run_sample_flow(
 def run_sample_flow_sync(
     runner_profile: str = "claude-code",
     workspace: Path | None = None,
+    workflow: WorkflowConfig | None = None,
+    prompt_prefix: str | None = None,
+    extra_checks: Callable[[Path], list[dict[str, Any]]] | None = None,
 ) -> SampleFlowResult:
-    return asyncio.run(run_sample_flow(runner_profile=runner_profile, workspace=workspace))
+    return asyncio.run(
+        run_sample_flow(
+            runner_profile=runner_profile,
+            workspace=workspace,
+            workflow=workflow,
+            prompt_prefix=prompt_prefix,
+            extra_checks=extra_checks,
+        )
+    )

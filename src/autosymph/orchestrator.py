@@ -32,9 +32,11 @@ from autosymph.logging.stream import LogStream
 from autosymph.logging.summarizer import ActivitySummarizer
 from autosymph.logging.timeline import TimelineExtractor
 from autosymph.resources import AcquiredResources, ResourcePool
+from autosymph.receipts import write_json_atomic
 from autosymph.runners.base import AgentRunner, EventType, RunResult
 from autosymph.runners import RunnerRegistry, default_runner_registry
 from autosymph.state_machine import ClaimState, Signal, StateMachine
+from autosymph.state_scripts import run_compiled_state_phase, validate_compiled_state
 from autosymph.workspace import Workspace, WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -476,6 +478,7 @@ class Orchestrator:
         runner_name: str,
     ) -> None:
         """Spawn an agent for an issue."""
+        validate_compiled_state(workflow_state, state_cfg)
         self.sm.mark_running(issue.id)
 
         # Read prompt at dispatch time (not cached)
@@ -554,6 +557,7 @@ class Orchestrator:
             self._run_agent(
                 issue,
                 workflow_state,
+                state_cfg,
                 prompt,
                 runner_config,
                 session_id,
@@ -581,6 +585,7 @@ class Orchestrator:
         self,
         issue: LinearIssue,
         workflow_state: str,
+        state_cfg: StateConfig,
         prompt: str,
         runner_config: dict[str, Any],
         session_id: str | None,
@@ -700,18 +705,103 @@ class Orchestrator:
                 runner_config["env_vars"] = resources.as_env()
                 logger.info("[%s] resources: %s", session_name, resources.items)
 
+            state_evidence = workspace.path / ".autosymph" / "state-runtime"
+            state_input = state_evidence / "input.json"
+            state_output = state_evidence / "output.json"
+            write_json_atomic(
+                state_input,
+                {
+                    "issue_id": issue.id,
+                    "identifier": issue.identifier,
+                    "title": issue.title,
+                    "workflow_state": workflow_state,
+                    "runner": runner_name,
+                    "workspace": str(workspace.path),
+                },
+            )
+            write_json_atomic(state_output, {})
+
+            async def run_state_phase(phase_name: str):
+                outcome = await asyncio.to_thread(
+                    run_compiled_state_phase,
+                    workflow_state,
+                    state_cfg,
+                    phase_name,
+                    state_input,
+                    state_output,
+                )
+                if outcome.results or outcome.error:
+                    on_raw_line(
+                        json.dumps(
+                            {
+                                "type": "autosymph.state_script",
+                                "state": workflow_state,
+                                **outcome.as_dict(),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                return outcome
+
+            preflight_error = None
+            for phase_name in ("enter", "run"):
+                phase_outcome = await run_state_phase(phase_name)
+                if not phase_outcome.success:
+                    preflight_error = (
+                        f"state {phase_name} script failed: "
+                        f"{phase_outcome.error or 'unknown failure'}"
+                    )
+                    break
+
             # The model-selection audit log lives in the runner
             # (runners/claude.py) so it captures the actual argv passed to claude,
             # not just the runner_config dict here. See ClaudeRunner.run.
-            logger.info("[%s] spawning agent runner=%s", session_name, runner_name)
-            result = await self.runners[runner_name].run(
-                prompt=prompt,
-                workspace_path=str(workspace.path),
-                config=runner_config,
-                session_id=session_id,
-                on_event=on_event,
-                on_raw_line=on_raw_line,
+            if preflight_error:
+                result = RunResult(success=False, exit_code=65, error=preflight_error)
+            else:
+                logger.info("[%s] spawning agent runner=%s", session_name, runner_name)
+                result = await self.runners[runner_name].run(
+                    prompt=prompt,
+                    workspace_path=str(workspace.path),
+                    config=runner_config,
+                    session_id=session_id,
+                    on_event=on_event,
+                    on_raw_line=on_raw_line,
+                )
+
+            write_json_atomic(
+                state_output,
+                {
+                    "success": result.success,
+                    "exit_code": result.exit_code,
+                    "session_id": result.session_id,
+                    "duration_seconds": result.duration_seconds,
+                    "token_usage": result.token_usage,
+                    "error": result.error,
+                },
             )
+            if result.success:
+                validation = await run_state_phase("validate")
+                if not validation.success:
+                    result.success = False
+                    result.exit_code = 65
+                    result.error = (
+                        "state validation script failed: "
+                        f"{validation.error or 'unknown failure'}"
+                    )
+            terminal_phase = "exit" if result.success else "recover"
+            terminal_outcome = await run_state_phase(terminal_phase)
+            if not terminal_outcome.success:
+                phase_error = (
+                    f"state {terminal_phase} script failed: "
+                    f"{terminal_outcome.error or 'unknown failure'}"
+                )
+                if result.success:
+                    result.success = False
+                    result.exit_code = 65
+                    result.error = phase_error
+                else:
+                    result.error = f"{result.error or 'agent failed'}; {phase_error}"
 
             # Store session_id for resume
             if result.session_id:

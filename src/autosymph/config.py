@@ -167,6 +167,13 @@ class StateTransitions(BaseModel):
         return list(self.__pydantic_extra__.items()) if self.__pydantic_extra__ else []
 
 
+class StateScriptDefinition(BaseModel):
+    phase: Literal["enter", "run", "validate", "exit", "recover", "guard", "effect"]
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    timeout_seconds: int = Field(ge=1)
+
+
 class StateConfig(BaseModel):
     type: Literal["agent", "gate", "terminal"]
     prompt: str | None = None
@@ -183,6 +190,11 @@ class StateConfig(BaseModel):
     mcp_config: str | None = None  # path to MCP config JSON (--mcp-config flag)
     allowed_tools: str | None = None  # --allowedTools flag value
     comments: StateCommentsConfig | None = None  # per-state comment rendering overrides
+    factory_root: str | None = None
+    factory_revision: int | None = Field(default=None, ge=1)
+    state_revision: int | None = Field(default=None, ge=1)
+    definition_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    scripts: list[StateScriptDefinition] = Field(default_factory=list)
 
 
 class PromptsConfig(BaseModel):

@@ -167,6 +167,62 @@ runners:
 workflow config, process arguments, receipts, or logs. OMP prompts use private,
 workspace-local files and are deleted when each attempt finishes.
 
+### Author factories as state packages
+
+The runtime graph can be generated from repository-native packages:
+
+```text
+factory.yaml
+states/
+  implement/
+    state.yaml
+    SKILL.md
+    schemas/input.json
+    schemas/output.json
+    scripts/*.sh|*.mjs
+```
+
+The normal authoring loop is:
+
+```bash
+autosymph factory init factories/product-week product-week --initial implement
+autosymph factory create-state factories/product-week done \
+  --kind terminal --description "Record the accepted result."
+autosymph factory create-state factories/product-week blocked \
+  --kind terminal --description "Record a rejected result."
+autosymph factory create-state factories/product-week implement \
+  --kind agent --runner codex --description "Build the bounded change." \
+  --transition complete=done --transition fail=blocked
+autosymph factory audit factories/product-week
+autosymph factory compile factories/product-week \
+  --project "Product Week" --runner codex --output workflow.compiled.yaml
+```
+
+Updates require an expected state revision and archive the prior package:
+
+```bash
+autosymph factory update-state factories/product-week implement \
+  --expected-revision 1 --patch-file implement-update.yaml
+```
+
+Every declared script is restricted to `.sh` or `.mjs`, stays inside its state
+package, and is SHA-256 pinned. `autosymph factory heal` plans repairs;
+`--apply` can currently restore executable permissions only when the script
+bytes match the pinned hash and a candidate audit improves without introducing
+new errors. Semantic graph problems always remain operator-reviewed, and the
+command stays nonzero while any audit errors remain.
+
+Compilation binds each state revision and the hash of every package file. The
+orchestrator rechecks that binding before prompt dispatch and again before
+running `enter`, `run`, `validate`, `exit`, or `recover` scripts, so authored
+bytes cannot drift underneath a live compiled workflow.
+
+Run the full authored → audited → compiled → model-backed proof locally:
+
+```bash
+autosymph factory sample --runner codex
+```
+
 ## Linear Setup
 
 Create a Linear API key and expose it as `LINEAR_API_KEY`.

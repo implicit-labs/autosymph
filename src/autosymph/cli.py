@@ -12,6 +12,7 @@ from pathlib import Path
 
 import click
 
+from autosymph.factory_cli import factory
 from autosymph.config import (
     ConfigError,
     WorkflowConfig,
@@ -66,6 +67,9 @@ def _setup_logging_file_only(log_root: Path | None = None) -> None:
 @click.version_option(package_name="autosymph")
 def main() -> None:
     """autosymph — AI agent orchestrator."""
+
+
+main.add_command(factory)
 
 
 @main.command("sample-flow")
