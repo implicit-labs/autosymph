@@ -15,11 +15,12 @@ class TestCodexCommand:
         assert cmd == [
             "codex",
             "exec",
-            "--full-auto",
+            "--sandbox",
+            "workspace-write",
             "--json",
             "-m",
             "gpt-5.4-codex",
-            "do it",
+            "-",
         ]
 
     def test_resume_command(self):
@@ -34,7 +35,7 @@ class TestCodexCommand:
             "s-1",
             "-m",
             "gpt-5.4-codex",
-            "continue",
+            "-",
         ]
 
     def test_missing_binary_returns_failed_result(self, monkeypatch):
@@ -79,6 +80,37 @@ class TestCodexParser:
         assert done_event is not None
         assert done_event.type == EventType.COMPLETION
         assert done_event.data["usage"]["input_tokens"] == 3
+
+    def test_current_command_execution_events(self):
+        runner = CodexRunner()
+        started = runner.parse_event(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {"id": "item-1", "type": "command_execution", "command": "pytest"},
+                }
+            )
+        )
+        completed = runner.parse_event(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item-1",
+                        "type": "command_execution",
+                        "command": "pytest",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "aggregated_output": "ok",
+                    },
+                }
+            )
+        )
+
+        assert started is not None and started.type == EventType.TOOL_CALL
+        assert started.data["tool_id"] == "item-1"
+        assert completed is not None and completed.type == EventType.TOOL_RESULT
+        assert completed.data["is_error"] is False
 
     def test_failed_turn_is_error(self):
         event = CodexRunner().parse_event(

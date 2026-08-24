@@ -32,9 +32,11 @@ from autosymph.logging.stream import LogStream
 from autosymph.logging.summarizer import ActivitySummarizer
 from autosymph.logging.timeline import TimelineExtractor
 from autosymph.resources import AcquiredResources, ResourcePool
+from autosymph.receipts import write_json_atomic
 from autosymph.runners.base import AgentRunner, EventType, RunResult
 from autosymph.runners import RunnerRegistry, default_runner_registry
 from autosymph.state_machine import ClaimState, Signal, StateMachine
+from autosymph.state_scripts import run_compiled_state_phase, validate_compiled_state
 from autosymph.workspace import Workspace, WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -87,7 +89,13 @@ class Orchestrator:
         self.linear = linear
         self.sm = state_machine
         self.workspace_mgr = workspace_mgr
-        self.runners = runner_registry or default_runner_registry()
+        adapter_runners = runner_registry or default_runner_registry()
+        # Named profiles resolve to one adapter implementation. Keep explicitly
+        # injected profile runners intact for tests/custom integrations.
+        self.runners = dict(adapter_runners)
+        for profile_name, definition in config.runners.available.items():
+            if profile_name not in self.runners and definition.type in adapter_runners:
+                self.runners[profile_name] = adapter_runners[definition.type]
         if runner is not None:
             self.runners["claude"] = runner
         self.runner = self.runners["claude"]  # backward-compatible test hook
@@ -470,6 +478,7 @@ class Orchestrator:
         runner_name: str,
     ) -> None:
         """Spawn an agent for an issue."""
+        validate_compiled_state(workflow_state, state_cfg)
         self.sm.mark_running(issue.id)
 
         # Read prompt at dispatch time (not cached)
@@ -494,16 +503,33 @@ class Orchestrator:
 
         logger.info("Dispatching %s → '%s' runner=%s", issue.identifier, workflow_state, runner_name)
 
-        # Build runner config from state + claude defaults (state overrides global)
+        # Build config from the selected named runner profile. Claude defaults
+        # remain fallback values only for Claude profiles; other adapters must
+        # not accidentally inherit Claude's model or permission mode.
+        runner_definition = self.config.runners.available[runner_name]
+        default_model = self.config.claude.model if runner_definition.type == "claude" else None
+        default_permission = (
+            self.config.claude.permission_mode if runner_definition.type == "claude" else None
+        )
         runner_config = {
-            "model": state_cfg.model or self.config.claude.model,
-            "permission_mode": state_cfg.permission_mode or self.config.claude.permission_mode,
+            "model": state_cfg.model or runner_definition.model or default_model,
+            "permission_mode": (
+                state_cfg.permission_mode
+                or runner_definition.permission_mode
+                or default_permission
+            ),
             "max_turns": state_cfg.max_turns or self.config.claude.max_turns,
             # Metadata only used by the runner's session-start log.
             "identifier": issue.identifier,
             "workflow_state": workflow_state,
             "prompt_path": state_cfg.prompt or "-",
             "runner": runner_name,
+            "adapter_type": runner_definition.type,
+            "auth_mode": runner_definition.auth_mode,
+            "auth_env": runner_definition.auth_env,
+            "profile": runner_definition.profile,
+            "sandbox": runner_definition.sandbox,
+            "max_time_seconds": runner_definition.max_time_seconds,
         }
         if state_cfg.allowed_tools:
             runner_config["allowed_tools"] = state_cfg.allowed_tools
@@ -531,6 +557,7 @@ class Orchestrator:
             self._run_agent(
                 issue,
                 workflow_state,
+                state_cfg,
                 prompt,
                 runner_config,
                 session_id,
@@ -558,6 +585,7 @@ class Orchestrator:
         self,
         issue: LinearIssue,
         workflow_state: str,
+        state_cfg: StateConfig,
         prompt: str,
         runner_config: dict[str, Any],
         session_id: str | None,
@@ -677,18 +705,103 @@ class Orchestrator:
                 runner_config["env_vars"] = resources.as_env()
                 logger.info("[%s] resources: %s", session_name, resources.items)
 
+            state_evidence = workspace.path / ".autosymph" / "state-runtime"
+            state_input = state_evidence / "input.json"
+            state_output = state_evidence / "output.json"
+            write_json_atomic(
+                state_input,
+                {
+                    "issue_id": issue.id,
+                    "identifier": issue.identifier,
+                    "title": issue.title,
+                    "workflow_state": workflow_state,
+                    "runner": runner_name,
+                    "workspace": str(workspace.path),
+                },
+            )
+            write_json_atomic(state_output, {})
+
+            async def run_state_phase(phase_name: str):
+                outcome = await asyncio.to_thread(
+                    run_compiled_state_phase,
+                    workflow_state,
+                    state_cfg,
+                    phase_name,
+                    state_input,
+                    state_output,
+                )
+                if outcome.results or outcome.error:
+                    on_raw_line(
+                        json.dumps(
+                            {
+                                "type": "autosymph.state_script",
+                                "state": workflow_state,
+                                **outcome.as_dict(),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                return outcome
+
+            preflight_error = None
+            for phase_name in ("enter", "run"):
+                phase_outcome = await run_state_phase(phase_name)
+                if not phase_outcome.success:
+                    preflight_error = (
+                        f"state {phase_name} script failed: "
+                        f"{phase_outcome.error or 'unknown failure'}"
+                    )
+                    break
+
             # The model-selection audit log lives in the runner
             # (runners/claude.py) so it captures the actual argv passed to claude,
             # not just the runner_config dict here. See ClaudeRunner.run.
-            logger.info("[%s] spawning agent runner=%s", session_name, runner_name)
-            result = await self.runners[runner_name].run(
-                prompt=prompt,
-                workspace_path=str(workspace.path),
-                config=runner_config,
-                session_id=session_id,
-                on_event=on_event,
-                on_raw_line=on_raw_line,
+            if preflight_error:
+                result = RunResult(success=False, exit_code=65, error=preflight_error)
+            else:
+                logger.info("[%s] spawning agent runner=%s", session_name, runner_name)
+                result = await self.runners[runner_name].run(
+                    prompt=prompt,
+                    workspace_path=str(workspace.path),
+                    config=runner_config,
+                    session_id=session_id,
+                    on_event=on_event,
+                    on_raw_line=on_raw_line,
+                )
+
+            write_json_atomic(
+                state_output,
+                {
+                    "success": result.success,
+                    "exit_code": result.exit_code,
+                    "session_id": result.session_id,
+                    "duration_seconds": result.duration_seconds,
+                    "token_usage": result.token_usage,
+                    "error": result.error,
+                },
             )
+            if result.success:
+                validation = await run_state_phase("validate")
+                if not validation.success:
+                    result.success = False
+                    result.exit_code = 65
+                    result.error = (
+                        "state validation script failed: "
+                        f"{validation.error or 'unknown failure'}"
+                    )
+            terminal_phase = "exit" if result.success else "recover"
+            terminal_outcome = await run_state_phase(terminal_phase)
+            if not terminal_outcome.success:
+                phase_error = (
+                    f"state {terminal_phase} script failed: "
+                    f"{terminal_outcome.error or 'unknown failure'}"
+                )
+                if result.success:
+                    result.success = False
+                    result.exit_code = 65
+                    result.error = phase_error
+                else:
+                    result.error = f"{result.error or 'agent failed'}; {phase_error}"
 
             # Store session_id for resume
             if result.session_id:

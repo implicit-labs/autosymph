@@ -83,7 +83,32 @@ RUNNER_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 class RunnerDefinition(BaseModel):
-    type: Literal["claude", "codex", "pi"]
+    """A named runner profile.
+
+    Multiple profiles may share one adapter type (for example OMP subscription
+    and OMP with an Anthropic API key) while keeping auth/session state isolated.
+    Secret values are never stored here; only an environment variable name may
+    be declared.
+    """
+
+    type: Literal["claude", "codex", "pi", "omp"]
+    model: str | None = None
+    auth_mode: Literal["subscription", "stored_profile", "environment"] = "subscription"
+    auth_env: str | None = None
+    profile: str | None = None
+    permission_mode: str | None = None
+    sandbox: Literal["read-only", "workspace-write"] | None = None
+    max_time_seconds: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def check_profile_contract(self) -> RunnerDefinition:
+        if self.auth_mode == "environment" and not self.auth_env:
+            raise ValueError("environment auth requires auth_env")
+        if self.auth_mode != "environment" and self.auth_env:
+            raise ValueError("auth_env is only valid for environment auth")
+        if self.type == "omp" and not self.profile:
+            raise ValueError("OMP runner profiles require profile")
+        return self
 
 
 class RunnerMatchRule(BaseModel):
@@ -142,6 +167,13 @@ class StateTransitions(BaseModel):
         return list(self.__pydantic_extra__.items()) if self.__pydantic_extra__ else []
 
 
+class StateScriptDefinition(BaseModel):
+    phase: Literal["enter", "run", "validate", "exit", "recover", "guard", "effect"]
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    timeout_seconds: int = Field(ge=1)
+
+
 class StateConfig(BaseModel):
     type: Literal["agent", "gate", "terminal"]
     prompt: str | None = None
@@ -158,6 +190,11 @@ class StateConfig(BaseModel):
     mcp_config: str | None = None  # path to MCP config JSON (--mcp-config flag)
     allowed_tools: str | None = None  # --allowedTools flag value
     comments: StateCommentsConfig | None = None  # per-state comment rendering overrides
+    factory_root: str | None = None
+    factory_revision: int | None = Field(default=None, ge=1)
+    state_revision: int | None = Field(default=None, ge=1)
+    definition_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    scripts: list[StateScriptDefinition] = Field(default_factory=list)
 
 
 class PromptsConfig(BaseModel):

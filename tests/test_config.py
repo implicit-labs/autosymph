@@ -13,6 +13,7 @@ from autosymph.config import (
     DeviceConfig,
     DeviceProjectOverride,
     LinearStatesConfig,
+    RunnerDefinition,
     TrackerConfig,
     WorkflowConfig,
     StateConfig,
@@ -112,6 +113,28 @@ class TestRunnerConfig:
 
         with pytest.raises(ConfigError, match="malformed runner label 'runner:'"):
             validate_config(cfg)
+
+    def test_named_omp_profiles_keep_auth_separate(self):
+        subscription = RunnerDefinition(
+            type="omp", auth_mode="stored_profile", profile="claude-subscription"
+        )
+        api = RunnerDefinition(
+            type="omp",
+            auth_mode="environment",
+            auth_env="ANTHROPIC_API_KEY",
+            profile="claude-api",
+        )
+
+        assert subscription.auth_env is None
+        assert api.auth_env == "ANTHROPIC_API_KEY"
+
+    def test_environment_auth_requires_env_name(self):
+        with pytest.raises(ValueError, match="environment auth requires auth_env"):
+            RunnerDefinition(type="omp", auth_mode="environment", profile="claude-api")
+
+    def test_omp_requires_profile(self):
+        with pytest.raises(ValueError, match="OMP runner profiles require profile"):
+            RunnerDefinition(type="omp")
 
 
 class TestProjectSlug:

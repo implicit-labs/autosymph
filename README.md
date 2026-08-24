@@ -13,7 +13,7 @@ skills, and human review gates where they matter.
 
 - Polls Linear for actionable issues.
 - Creates isolated worktrees for each issue.
-- Dispatches Claude Code, Codex, or Pi runners.
+- Dispatches Claude Code, Codex, Pi, or OMP runner profiles.
 - Uses repo-local prompts for each workflow state.
 - Runs multiple projects from one supervisor.
 - Shares local resources such as simulator slots and dev ports.
@@ -115,6 +115,112 @@ For a one-off config file:
 
 ```bash
 uv run autosymph start -c path/to/project.yaml
+```
+
+### Prove the runner and transition gate locally
+
+The sample flow creates a temporary Git repository, asks a real runner to make
+one bounded edit, writes a hash-bound attempt receipt, and runs a deterministic
+validator before the state machine may advance:
+
+```bash
+uv run autosymph sample-flow --runner codex
+uv run autosymph sample-flow --runner claude-code
+```
+
+A valid run prints `implement -> verify -> done` and the paths to its raw JSONL,
+attempt receipt, proof, and final result. A provider limit, failed process,
+missing proof, wrong content, out-of-scope edit, or mutated artifact fails closed
+and never reaches `done`.
+
+Named profiles keep adapter and authentication policy separate:
+
+```yaml
+runners:
+  default: codex
+  available:
+    claude-code:
+      type: claude
+      model: sonnet
+      auth_mode: subscription
+      permission_mode: acceptEdits
+    codex:
+      type: codex
+      auth_mode: subscription
+      sandbox: workspace-write
+    omp-subscription:
+      type: omp
+      model: anthropic/claude-sonnet
+      auth_mode: stored_profile
+      profile: autosymph-subscription
+      permission_mode: write
+    omp-claude-api:
+      type: omp
+      model: anthropic/claude-sonnet
+      auth_mode: environment
+      auth_env: ANTHROPIC_API_KEY
+      profile: autosymph-claude-api
+      permission_mode: write
+```
+
+`auth_env` names an environment variable; secret values are never part of the
+workflow config, process arguments, receipts, or logs. OMP prompts use private,
+workspace-local files and are deleted when each attempt finishes.
+
+### Author factories as state packages
+
+The runtime graph can be generated from repository-native packages:
+
+```text
+factory.yaml
+states/
+  implement/
+    state.yaml
+    SKILL.md
+    schemas/input.json
+    schemas/output.json
+    scripts/*.sh|*.mjs
+```
+
+The normal authoring loop is:
+
+```bash
+autosymph factory init factories/product-week product-week --initial implement
+autosymph factory create-state factories/product-week done \
+  --kind terminal --description "Record the accepted result."
+autosymph factory create-state factories/product-week blocked \
+  --kind terminal --description "Record a rejected result."
+autosymph factory create-state factories/product-week implement \
+  --kind agent --runner codex --description "Build the bounded change." \
+  --transition complete=done --transition fail=blocked
+autosymph factory audit factories/product-week
+autosymph factory compile factories/product-week \
+  --project "Product Week" --runner codex --output workflow.compiled.yaml
+```
+
+Updates require an expected state revision and archive the prior package:
+
+```bash
+autosymph factory update-state factories/product-week implement \
+  --expected-revision 1 --patch-file implement-update.yaml
+```
+
+Every declared script is restricted to `.sh` or `.mjs`, stays inside its state
+package, and is SHA-256 pinned. `autosymph factory heal` plans repairs;
+`--apply` can currently restore executable permissions only when the script
+bytes match the pinned hash and a candidate audit improves without introducing
+new errors. Semantic graph problems always remain operator-reviewed, and the
+command stays nonzero while any audit errors remain.
+
+Compilation binds each state revision and the hash of every package file. The
+orchestrator rechecks that binding before prompt dispatch and again before
+running `enter`, `run`, `validate`, `exit`, or `recover` scripts, so authored
+bytes cannot drift underneath a live compiled workflow.
+
+Run the full authored → audited → compiled → model-backed proof locally:
+
+```bash
+autosymph factory sample --runner codex
 ```
 
 ## Linear Setup
@@ -379,4 +485,3 @@ source code with either upstream project.
 ## License
 
 autosymph is released under the [MIT License](LICENSE).
-
