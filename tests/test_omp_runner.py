@@ -60,6 +60,12 @@ def test_parser_handles_tool_and_completion_events():
     assert done is not None and done.type == EventType.COMPLETION
 
 
+def test_session_id_uses_omp_v3_session_event_id():
+    assert OmpRunner._session_id_from(
+        {"type": "session", "version": 3, "id": "session-v3"}
+    ) == "session-v3"
+
+
 def test_parser_treats_nested_omp_model_error_as_failure_event():
     event = OmpRunner().parse_event(
         json.dumps(

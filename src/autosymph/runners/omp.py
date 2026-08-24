@@ -254,6 +254,10 @@ class OmpRunner(AgentRunner):
             value = data.get(key)
             if isinstance(value, str) and value:
                 return value
+        if data.get("type") == "session":
+            value = data.get("id")
+            if isinstance(value, str) and value:
+                return value
         return None
 
     @staticmethod
