@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shlex
@@ -65,6 +66,32 @@ def _setup_logging_file_only(log_root: Path | None = None) -> None:
 @click.version_option(package_name="autosymph")
 def main() -> None:
     """autosymph — AI agent orchestrator."""
+
+
+@main.command("sample-flow")
+@click.option(
+    "--runner",
+    "runner_profile",
+    type=click.Choice(["claude-code", "codex", "omp-subscription", "omp-claude-api"]),
+    default="claude-code",
+    show_default=True,
+)
+@click.option(
+    "--workspace",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Empty directory for the sample repository; defaults to a new /tmp directory.",
+)
+def sample_flow(runner_profile: str, workspace: Path | None) -> None:
+    """Run a real local implement -> deterministic verify -> done flow."""
+    from autosymph.sample_flow import run_sample_flow_sync
+
+    result = run_sample_flow_sync(runner_profile=runner_profile, workspace=workspace)
+    click.echo(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    if not result.success:
+        raise click.ClickException(
+            "sample flow did not reach done: " + ", ".join(result.gate_reasons)
+        )
 
 
 def _find_config(explicit: str | None) -> Path:

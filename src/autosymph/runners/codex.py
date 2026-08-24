@@ -50,6 +50,7 @@ class CodexRunner(AgentRunner):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workspace_path,
@@ -62,6 +63,11 @@ class CodexRunner(AgentRunner):
                 exit_code=-1,
                 error="'codex' CLI not found - is Codex installed?",
             )
+
+        if proc.stdin:
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
 
         try:
             async for line in self._read_lines(proc.stdout):
@@ -77,15 +83,7 @@ class CodexRunner(AgentRunner):
 
                 usage = event.data.get("usage", {})
                 if usage:
-                    for key in (
-                        "input_tokens",
-                        "output_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                    ):
-                        val = usage.get(key)
-                        if isinstance(val, int):
-                            token_usage[key] = val
+                    token_usage.update(self._normalize_usage(usage))
 
                 if on_event:
                     on_event(event)
@@ -128,12 +126,19 @@ class CodexRunner(AgentRunner):
         if session_id:
             cmd = ["codex", "exec", "resume", "--json", session_id]
         else:
-            cmd = ["codex", "exec", "--full-auto", "--json"]
+            cmd = [
+                "codex",
+                "exec",
+                "--sandbox",
+                str(config.get("sandbox") or "workspace-write"),
+                "--json",
+            ]
 
         model = config.get("model")
         if model:
             cmd.extend(["-m", model])
-        cmd.append(prompt)
+        # Prompt is supplied over stdin so it is not exposed in argv/process listings.
+        cmd.append("-")
         return cmd
 
     @staticmethod
@@ -153,6 +158,8 @@ class CodexRunner(AgentRunner):
         now = datetime.now(timezone.utc)
         event_type = str(data.get("type") or data.get("event") or "")
 
+        if event_type == "thread.started":
+            return AgentEvent(type=EventType.SYSTEM, timestamp=now, data=data)
         if event_type == "turn.completed":
             return AgentEvent(type=EventType.COMPLETION, timestamp=now, data=data)
         if event_type == "turn.failed":
@@ -167,6 +174,37 @@ class CodexRunner(AgentRunner):
                 timestamp=now,
                 data={**data, "message": self._error_message(data)},
             )
+
+        item = data.get("item")
+        if isinstance(item, dict) and item.get("type") == "command_execution":
+            tool_id = self._tool_id(data)
+            command = item.get("command", "")
+            if event_type == "item.started":
+                return AgentEvent(
+                    type=EventType.TOOL_CALL,
+                    timestamp=now,
+                    data={
+                        **data,
+                        "tool_name": "Bash",
+                        "tool_id": tool_id,
+                        "input": {"command": command},
+                    },
+                )
+            if event_type == "item.completed":
+                exit_code = item.get("exit_code")
+                status = str(item.get("status") or "").lower()
+                is_error = status in {"failed", "error", "failure"}
+                is_error = is_error or (isinstance(exit_code, int) and exit_code != 0)
+                return AgentEvent(
+                    type=EventType.TOOL_RESULT,
+                    timestamp=now,
+                    data={
+                        **data,
+                        "tool_id": tool_id,
+                        "content": item.get("aggregated_output", ""),
+                        "is_error": is_error,
+                    },
+                )
 
         if event_type in {"item.updated", "item.completed", "message.delta"}:
             text = self._extract_text(data)
@@ -209,6 +247,25 @@ class CodexRunner(AgentRunner):
             if isinstance(value, str) and value:
                 return value
         return None
+
+    @staticmethod
+    def _normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
+        """Normalize current and legacy Codex token counters."""
+        aliases = {
+            "input_tokens": "input_tokens",
+            "output_tokens": "output_tokens",
+            "cached_input_tokens": "cache_read_input_tokens",
+            "cache_read_input_tokens": "cache_read_input_tokens",
+            "cache_write_input_tokens": "cache_creation_input_tokens",
+            "cache_creation_input_tokens": "cache_creation_input_tokens",
+            "reasoning_output_tokens": "reasoning_output_tokens",
+        }
+        normalized: dict[str, int] = {}
+        for source_key, target_key in aliases.items():
+            value = usage.get(source_key)
+            if isinstance(value, int):
+                normalized[target_key] = value
+        return normalized
 
     @staticmethod
     def _extract_text(data: dict[str, Any]) -> str:

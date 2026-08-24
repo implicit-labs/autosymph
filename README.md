@@ -13,7 +13,7 @@ skills, and human review gates where they matter.
 
 - Polls Linear for actionable issues.
 - Creates isolated worktrees for each issue.
-- Dispatches Claude Code, Codex, or Pi runners.
+- Dispatches Claude Code, Codex, Pi, or OMP runner profiles.
 - Uses repo-local prompts for each workflow state.
 - Runs multiple projects from one supervisor.
 - Shares local resources such as simulator slots and dev ports.
@@ -116,6 +116,56 @@ For a one-off config file:
 ```bash
 uv run autosymph start -c path/to/project.yaml
 ```
+
+### Prove the runner and transition gate locally
+
+The sample flow creates a temporary Git repository, asks a real runner to make
+one bounded edit, writes a hash-bound attempt receipt, and runs a deterministic
+validator before the state machine may advance:
+
+```bash
+uv run autosymph sample-flow --runner codex
+uv run autosymph sample-flow --runner claude-code
+```
+
+A valid run prints `implement -> verify -> done` and the paths to its raw JSONL,
+attempt receipt, proof, and final result. A provider limit, failed process,
+missing proof, wrong content, out-of-scope edit, or mutated artifact fails closed
+and never reaches `done`.
+
+Named profiles keep adapter and authentication policy separate:
+
+```yaml
+runners:
+  default: codex
+  available:
+    claude-code:
+      type: claude
+      model: sonnet
+      auth_mode: subscription
+      permission_mode: acceptEdits
+    codex:
+      type: codex
+      auth_mode: subscription
+      sandbox: workspace-write
+    omp-subscription:
+      type: omp
+      model: anthropic/claude-sonnet
+      auth_mode: stored_profile
+      profile: autosymph-subscription
+      permission_mode: write
+    omp-claude-api:
+      type: omp
+      model: anthropic/claude-sonnet
+      auth_mode: environment
+      auth_env: ANTHROPIC_API_KEY
+      profile: autosymph-claude-api
+      permission_mode: write
+```
+
+`auth_env` names an environment variable; secret values are never part of the
+workflow config, process arguments, receipts, or logs. OMP prompts use private,
+workspace-local files and are deleted when each attempt finishes.
 
 ## Linear Setup
 
@@ -379,4 +429,3 @@ source code with either upstream project.
 ## License
 
 autosymph is released under the [MIT License](LICENSE).
-

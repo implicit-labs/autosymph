@@ -83,7 +83,32 @@ RUNNER_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 class RunnerDefinition(BaseModel):
-    type: Literal["claude", "codex", "pi"]
+    """A named runner profile.
+
+    Multiple profiles may share one adapter type (for example OMP subscription
+    and OMP with an Anthropic API key) while keeping auth/session state isolated.
+    Secret values are never stored here; only an environment variable name may
+    be declared.
+    """
+
+    type: Literal["claude", "codex", "pi", "omp"]
+    model: str | None = None
+    auth_mode: Literal["subscription", "stored_profile", "environment"] = "subscription"
+    auth_env: str | None = None
+    profile: str | None = None
+    permission_mode: str | None = None
+    sandbox: Literal["read-only", "workspace-write"] | None = None
+    max_time_seconds: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def check_profile_contract(self) -> RunnerDefinition:
+        if self.auth_mode == "environment" and not self.auth_env:
+            raise ValueError("environment auth requires auth_env")
+        if self.auth_mode != "environment" and self.auth_env:
+            raise ValueError("auth_env is only valid for environment auth")
+        if self.type == "omp" and not self.profile:
+            raise ValueError("OMP runner profiles require profile")
+        return self
 
 
 class RunnerMatchRule(BaseModel):

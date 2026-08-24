@@ -87,7 +87,13 @@ class Orchestrator:
         self.linear = linear
         self.sm = state_machine
         self.workspace_mgr = workspace_mgr
-        self.runners = runner_registry or default_runner_registry()
+        adapter_runners = runner_registry or default_runner_registry()
+        # Named profiles resolve to one adapter implementation. Keep explicitly
+        # injected profile runners intact for tests/custom integrations.
+        self.runners = dict(adapter_runners)
+        for profile_name, definition in config.runners.available.items():
+            if profile_name not in self.runners and definition.type in adapter_runners:
+                self.runners[profile_name] = adapter_runners[definition.type]
         if runner is not None:
             self.runners["claude"] = runner
         self.runner = self.runners["claude"]  # backward-compatible test hook
@@ -494,16 +500,33 @@ class Orchestrator:
 
         logger.info("Dispatching %s → '%s' runner=%s", issue.identifier, workflow_state, runner_name)
 
-        # Build runner config from state + claude defaults (state overrides global)
+        # Build config from the selected named runner profile. Claude defaults
+        # remain fallback values only for Claude profiles; other adapters must
+        # not accidentally inherit Claude's model or permission mode.
+        runner_definition = self.config.runners.available[runner_name]
+        default_model = self.config.claude.model if runner_definition.type == "claude" else None
+        default_permission = (
+            self.config.claude.permission_mode if runner_definition.type == "claude" else None
+        )
         runner_config = {
-            "model": state_cfg.model or self.config.claude.model,
-            "permission_mode": state_cfg.permission_mode or self.config.claude.permission_mode,
+            "model": state_cfg.model or runner_definition.model or default_model,
+            "permission_mode": (
+                state_cfg.permission_mode
+                or runner_definition.permission_mode
+                or default_permission
+            ),
             "max_turns": state_cfg.max_turns or self.config.claude.max_turns,
             # Metadata only used by the runner's session-start log.
             "identifier": issue.identifier,
             "workflow_state": workflow_state,
             "prompt_path": state_cfg.prompt or "-",
             "runner": runner_name,
+            "adapter_type": runner_definition.type,
+            "auth_mode": runner_definition.auth_mode,
+            "auth_env": runner_definition.auth_env,
+            "profile": runner_definition.profile,
+            "sandbox": runner_definition.sandbox,
+            "max_time_seconds": runner_definition.max_time_seconds,
         }
         if state_cfg.allowed_tools:
             runner_config["allowed_tools"] = state_cfg.allowed_tools
