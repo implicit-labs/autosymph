@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import autosymph.ledger as ledger_module
 from autosymph.ledger import (
     SCHEMA_VERSION,
     LedgerError,
@@ -258,6 +259,9 @@ def test_jsonl_export_manifest_counts_hash_and_redacts_secrets(tmp_path: Path) -
             payload={"api_key": secret, "detail": f"Authorization: Bearer {secret}"},
         )
         manifest = ledger.export_jsonl(output)
+        stored_payloads = "\n".join(
+            row[0] for row in ledger._connection.execute("SELECT payload_json FROM events")
+        )
 
     lines = output.read_text(encoding="utf-8").splitlines()
     exported_body = "\n".join(lines[1:]) + "\n"
@@ -267,7 +271,23 @@ def test_jsonl_export_manifest_counts_hash_and_redacts_secrets(tmp_path: Path) -
     assert manifest.row_counts["events"] == 2
     assert hashlib.sha256(exported_body.encode()).hexdigest() == manifest.content_sha256
     assert secret not in output.read_text(encoding="utf-8")
+    assert secret not in stored_payloads
     assert "[REDACTED]" in output.read_text(encoding="utf-8")
+
+
+def test_migration_errors_do_not_echo_sql_or_secrets(tmp_path: Path, monkeypatch) -> None:
+    secret = "password=do-not-leak"
+    monkeypatch.setattr(
+        ledger_module,
+        "_MIGRATIONS",
+        ((1, "broken", f"THIS IS NOT SQL {secret}"),),
+    )
+
+    with pytest.raises(LedgerMigrationError) as error:
+        SQLiteLedger(tmp_path / "broken.db")
+
+    assert secret not in str(error.value)
+    assert str(error.value) == "Ledger migration failed"
 
 
 def test_log_metadata_redacts_secret_bearing_errors(tmp_path: Path) -> None:
