@@ -202,9 +202,9 @@ def compute_registry_update(
 
     # Retarget existing stale entries first so old replacements get updated
     for stale_id, replacement in current_stale.items():
-        family = family_of(stale_id)
-        if family and family in api_latest:
-            new_stale[stale_id] = api_latest[family]
+        stale_family = family_of(stale_id)
+        if stale_family and stale_family in api_latest:
+            new_stale[stale_id] = api_latest[stale_family]
         else:
             new_stale[stale_id] = replacement
 

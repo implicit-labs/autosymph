@@ -29,6 +29,7 @@ dev = [
     "pytest-mock>=3.12",
     "mypy>=1.10",
     "ruff>=0.4",
+    "types-PyYAML",
 ]
 
 [project.scripts]
