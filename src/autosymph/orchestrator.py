@@ -26,7 +26,12 @@ from autosymph.config import (
     ConfigError,
 )
 from autosymph.linear_client import LinearClient, LinearIssue
-from autosymph.logging.braintrust import BraintrustTracer, is_enabled as bt_enabled
+from autosymph.ledger import Ledger, LedgerError, RunAllocation, SQLiteLedger
+from autosymph.logging.braintrust import (
+    AsyncBraintrustProjector,
+    BraintrustTracer,
+    is_enabled as bt_enabled,
+)
 from autosymph.logging.events import EventLog
 from autosymph.logging.stream import LogStream
 from autosymph.logging.summarizer import ActivitySummarizer
@@ -81,6 +86,7 @@ class Orchestrator:
         shutdown_event: asyncio.Event | None = None,
         resource_pool: ResourcePool | None = None,
         concurrency_mgr: ConcurrencyManager | None = None,
+        ledger: Ledger | None = None,
     ) -> None:
         self.config = config
         self.config_path = config_path
@@ -98,13 +104,43 @@ class Orchestrator:
         self.log_stream = LogStream(log_root, project_slug=config.project_slug)
         self.event_log = EventLog(log_root)
         self._warnings: list[str] = []  # startup warnings surfaced in TUI
-        self.tracer: BraintrustTracer | None = None
+        self._owns_ledger = ledger is None
+        if ledger is not None:
+            self.ledger = ledger
+        else:
+            ledger_path = config.reliability.resolved_database_path(log_root)
+            try:
+                self.ledger = SQLiteLedger(
+                    ledger_path,
+                    backup_before_migrate=config.reliability.backup_before_migrate,
+                )
+            except LedgerError:
+                if not config.reliability.recover_read_only or not ledger_path.exists():
+                    raise
+                logger.exception(
+                    "Ledger startup validation failed; attempting read-only recovery"
+                )
+                self.ledger = SQLiteLedger(ledger_path, read_only=True)
+        if not self.ledger.read_only:
+            reconciled = self.ledger.reconcile_open_runs(project_slug=config.project_slug)
+            if reconciled:
+                logger.warning(
+                    "Reconciled %d interrupted run(s) from a previous process",
+                    len(reconciled),
+                )
+        if self.ledger.read_only:
+            self._warnings.append(
+                "reliability ledger opened read-only — new dispatches are blocked"
+            )
+        self.tracer: AsyncBraintrustProjector | BraintrustTracer | None = None
         tracing_cfg = config.logging.tracing
         if bt_enabled(tracing_cfg.api_key):
             try:
-                self.tracer = BraintrustTracer(
-                    project=tracing_cfg.project,
-                    api_key=tracing_cfg.api_key,
+                self.tracer = AsyncBraintrustProjector(
+                    BraintrustTracer(
+                        project=tracing_cfg.project,
+                        api_key=tracing_cfg.api_key,
+                    )
                 )
             except Exception:
                 logger.warning("Braintrust tracer init failed — tracing disabled", exc_info=True)
@@ -132,6 +168,24 @@ class Orchestrator:
     def project_slug(self) -> str:
         """URL-safe project identifier from config."""
         return self.config.project_slug
+
+    def _trace_call(self, method: str, *args: Any, **kwargs: Any) -> None:
+        """Project to Braintrust without letting it affect factory state."""
+        tracer = self.tracer
+        if tracer is None:
+            return
+        if isinstance(tracer, AsyncBraintrustProjector):
+            tracer.submit(method, *args, **kwargs)
+            return
+        try:
+            getattr(tracer, method)(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("Braintrust %s failed — tracing disabled", method, exc_info=True)
+            self._replace_warning(
+                "Braintrust",
+                f"Braintrust projection failed ({exc.__class__.__name__}) — tracing disabled",
+            )
+            self.tracer = None
 
     def _resolve_prompt_path(self, prompt_ref: str) -> Path:
         """Resolve a prompt path from config.
@@ -193,6 +247,10 @@ class Orchestrator:
                 pass  # Normal — just means the interval elapsed
 
         logger.info("Orchestrator stopped after %d ticks", self._tick_count)
+        if isinstance(self.tracer, AsyncBraintrustProjector):
+            self.tracer.close()
+        if self._owns_ledger:
+            self.ledger.close()
 
     async def poll_tick(self) -> None:
         """Single poll iteration — fetch, reconcile, dispatch. Lock prevents concurrent polls."""
@@ -266,7 +324,7 @@ class Orchestrator:
                     ident, idle_s, stall_timeout_s,
                 )
                 self.event_log.timeout(ident, agent.workflow_state)
-                await self._cancel_agent(issue_id)
+                await self._cancel_agent(issue_id, terminal_status="timed_out")
                 self.sm.release(issue_id)
 
     # -- Dispatch --
@@ -470,61 +528,54 @@ class Orchestrator:
         runner_name: str,
     ) -> None:
         """Spawn an agent for an issue."""
-        self.sm.mark_running(issue.id)
+        try:
+            allocation = self.ledger.allocate_run(
+                project_slug=self.project_slug,
+                issue_id=issue.id,
+                issue_identifier=issue.identifier,
+                state=workflow_state,
+                runner=runner_name,
+                metadata={"model": state_cfg.model or self.config.claude.model},
+            )
+        except Exception as exc:
+            logger.exception("Durable dispatch allocation failed for %s", issue.identifier)
+            self._replace_warning(
+                issue.identifier,
+                f"{issue.identifier}: durable dispatch blocked — {str(exc)[:80]}",
+            )
+            self.sm.release(issue.id)
+            if self._concurrency_mgr:
+                await self._concurrency_mgr.release(self.project_slug)
+            return
 
-        # Read prompt at dispatch time (not cached)
-        prompt = ""
-        if state_cfg.prompt:
-            prompt_path = self._resolve_prompt_path(state_cfg.prompt)
-            if prompt_path.exists():
-                prompt = prompt_path.read_text()
-            else:
-                logger.warning("Prompt file not found: %s", prompt_path)
-
-        # Prepend global prompt if configured
-        if self.config.prompts.global_prompt:
-            global_path = self._resolve_prompt_path(self.config.prompts.global_prompt)
-            if global_path.exists():
-                prompt = global_path.read_text() + "\n\n" + prompt
-
-        # Inject issue context into prompt
-        prompt = f"Issue: {issue.identifier} — {issue.title}\n\n{prompt}"
-        if issue.description:
-            prompt += f"\n\n## Issue Description\n\n{issue.description}"
-
-        logger.info("Dispatching %s → '%s' runner=%s", issue.identifier, workflow_state, runner_name)
-
-        # Build runner config from state + claude defaults (state overrides global)
-        runner_config = {
-            "model": state_cfg.model or self.config.claude.model,
-            "permission_mode": state_cfg.permission_mode or self.config.claude.permission_mode,
-            "max_turns": state_cfg.max_turns or self.config.claude.max_turns,
-            # Metadata only used by the runner's session-start log.
-            "identifier": issue.identifier,
-            "workflow_state": workflow_state,
-            "prompt_path": state_cfg.prompt or "-",
-            "runner": runner_name,
-        }
-        if state_cfg.allowed_tools:
-            runner_config["allowed_tools"] = state_cfg.allowed_tools
-        if state_cfg.mcp_config:
-            runner_config["mcp_config"] = state_cfg.mcp_config
-
-        # Session resume if configured and we have a prior session
-        session_id = None
-        if state_cfg.session == "inherit":
-            session_id = self._session_ids.get((issue.id, runner_name))
-
-        # Issue slug for worktree branch naming (e.g. "issue-123")
-        issue_slug = issue.identifier.lower()
-
-        # Acquire resources (sims, ports) before dispatch
-        # Use the source repo path for iOS auto-detection (all worktrees share the same codebase)
-        resources = await self.resource_pool.acquire_for_issue(
-            issue.id, workflow_state, issue.labels,
-            workspace_path=self.workspace_mgr.repo,
-            project_slug=self.project_slug if self._concurrency_mgr else None,
-        )
+        try:
+            self.sm.mark_running(issue.id)
+            prompt, runner_config, session_id, issue_slug = self._prepare_agent_dispatch(
+                issue, workflow_state, state_cfg, runner_name
+            )
+            # Acquire resources before creating the task. The source repo is
+            # used for project-type detection because all worktrees share it.
+            resources = await self.resource_pool.acquire_for_issue(
+                issue.id, workflow_state, issue.labels,
+                workspace_path=self.workspace_mgr.repo,
+                project_slug=self.project_slug if self._concurrency_mgr else None,
+            )
+        except Exception as exc:
+            self.ledger.record_terminal(
+                run_id=allocation.run_id,
+                event_type="preflight_blocked",
+                status="preflight_blocked",
+                payload={
+                    "stage": "dispatch_preflight",
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+            logger.exception("Dispatch preflight failed for %s", issue.identifier)
+            self.sm.release(issue.id)
+            if self._concurrency_mgr:
+                await self._concurrency_mgr.release(self.project_slug)
+            return
 
         # Spawn as async task
         task = asyncio.create_task(
@@ -537,17 +588,64 @@ class Orchestrator:
                 issue_slug,
                 runner_name,
                 resources,
+                allocation,
             ),
             name=f"agent-{issue.identifier}",
         )
         self._running[issue.id] = _RunningAgent(
             task=task,
+            run_id=allocation.run_id,
             workflow_state=workflow_state,
             runner_name=runner_name,
             started_at=time.monotonic(),
             last_activity=time.monotonic(),
             dispatched_at_iso=_utc_now_iso(),
         )
+
+    def _prepare_agent_dispatch(
+        self,
+        issue: LinearIssue,
+        workflow_state: str,
+        state_cfg: Any,
+        runner_name: str,
+    ) -> tuple[str, dict[str, Any], str | None, str]:
+        """Build prompt and runner inputs before acquiring resources."""
+        prompt = ""
+        if state_cfg.prompt:
+            prompt_path = self._resolve_prompt_path(state_cfg.prompt)
+            if prompt_path.exists():
+                prompt = prompt_path.read_text()
+            else:
+                logger.warning("Prompt file not found: %s", prompt_path)
+
+        if self.config.prompts.global_prompt:
+            global_path = self._resolve_prompt_path(self.config.prompts.global_prompt)
+            if global_path.exists():
+                prompt = global_path.read_text() + "\n\n" + prompt
+
+        prompt = f"Issue: {issue.identifier} — {issue.title}\n\n{prompt}"
+        if issue.description:
+            prompt += f"\n\n## Issue Description\n\n{issue.description}"
+
+        logger.info("Dispatching %s → '%s' runner=%s", issue.identifier, workflow_state, runner_name)
+        runner_config: dict[str, Any] = {
+            "model": state_cfg.model or self.config.claude.model,
+            "permission_mode": state_cfg.permission_mode or self.config.claude.permission_mode,
+            "max_turns": state_cfg.max_turns or self.config.claude.max_turns,
+            "identifier": issue.identifier,
+            "workflow_state": workflow_state,
+            "prompt_path": state_cfg.prompt or "-",
+            "runner": runner_name,
+        }
+        if state_cfg.allowed_tools:
+            runner_config["allowed_tools"] = state_cfg.allowed_tools
+        if state_cfg.mcp_config:
+            runner_config["mcp_config"] = state_cfg.mcp_config
+
+        session_id = None
+        if state_cfg.session == "inherit":
+            session_id = self._session_ids.get((issue.id, runner_name))
+        return prompt, runner_config, session_id, issue.identifier.lower()
 
     @staticmethod
     def _session_name(state: str, identifier: str, run: int) -> str:
@@ -564,12 +662,23 @@ class Orchestrator:
         issue_slug: str,
         runner_name: str,
         resources: AcquiredResources | None = None,
+        allocation: RunAllocation | None = None,
     ) -> None:
         """Create worktree, run agent, log to disk, post to Linear, clean up."""
         workspace = None
         failed = False
         log_path = None
-        run_number = self.log_stream.count_runs(issue_slug, workflow_state) + 1
+        if allocation is None:
+            allocation = self.ledger.allocate_run(
+                project_slug=self.project_slug,
+                issue_id=issue.id,
+                issue_identifier=issue.identifier,
+                state=workflow_state,
+                runner=runner_name,
+                metadata={"model": runner_config.get("model")},
+            )
+        run_id = allocation.run_id
+        run_number = allocation.attempt
         session_name = self._session_name(workflow_state, issue.identifier, run_number)
         timeline = TimelineExtractor()
         summarizer = ActivitySummarizer()
@@ -577,10 +686,20 @@ class Orchestrator:
         try:
             # Tier 2: open log file
             log_path = self.log_stream.open(issue_slug, workflow_state, run_number)
+            self.ledger.mark_run_started(run_id, raw_log_path=log_path)
 
             # Tier 3: log dispatch
             self.event_log.dispatch(
                 issue.identifier, workflow_state, run_number, session_name, runner=runner_name,
+            )
+            self.ledger.append_event(
+                run_id=run_id,
+                project_slug=self.project_slug,
+                issue_id=issue.id,
+                issue_identifier=issue.identifier,
+                event_type="runner_started",
+                idempotency_key=f"runner-started:{run_id}",
+                payload={"session_name": session_name, "runner": runner_name},
             )
 
             # Create isolated worktree
@@ -614,15 +733,15 @@ class Orchestrator:
             await self.workspace_mgr.prepare(workspace)
 
             # Braintrust: open run span
-            if self.tracer:
-                self.tracer.start_run(
-                    issue_id=issue.id,
-                    identifier=issue.identifier,
-                    state=workflow_state,
-                    run_number=run_number,
-                    prompt=prompt,
-                    config=runner_config,
-                )
+            self._trace_call(
+                "start_run",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                state=workflow_state,
+                run_number=run_number,
+                prompt=prompt,
+                config=runner_config,
+            )
 
             def on_event(event):
                 self.mark_activity(issue.id)
@@ -661,8 +780,7 @@ class Orchestrator:
                             + usage.get("cache_read_input_tokens", 0)
                         )
                 # Braintrust: forward events for tool span creation
-                if self.tracer:
-                    self.tracer.on_event(issue.id, event)
+                self._trace_call("on_event", issue.id, event)
 
             def on_raw_line(line):
                 self.mark_activity(issue.id)  # any stdout = not stalled
@@ -714,6 +832,7 @@ class Orchestrator:
                     session_id=result.session_id,
                     error=result.error,
                     runner=runner_name,
+                    run_id=run_id,
                 )
 
             # Tier 3: log outcome
@@ -726,6 +845,20 @@ class Orchestrator:
                 self.event_log.fail(
                     issue.identifier, workflow_state, run_number, result.error,
                 )
+
+            self.ledger.record_terminal(
+                run_id=run_id,
+                event_type="run_completed" if result.success else "run_failed",
+                status="completed" if result.success else "failed",
+                payload={
+                    "exit_code": result.exit_code,
+                    "duration_seconds": result.duration_seconds,
+                    "token_usage": result.token_usage,
+                    "session_id": result.session_id,
+                    "runner": runner_name,
+                    "error": result.error,
+                },
+            )
 
             # Post summary comment to Linear (activity summary preferred, timeline fallback)
             await self._post_run_summary(
@@ -741,16 +874,28 @@ class Orchestrator:
             )
 
             failed = not result.success
-            await self.on_agent_complete(issue.id, result.success, issue)
+            await self.on_agent_complete(issue.id, result.success, issue, run_id=run_id)
 
         except asyncio.CancelledError:
             logger.info("[%s] cancelled", session_name)
             self.event_log.fail(issue.identifier, workflow_state, run_number, "cancelled")
+            self.ledger.record_terminal(
+                run_id=run_id,
+                event_type="run_cancelled",
+                status="cancelled",
+                payload={"reason": "cancelled"},
+            )
             failed = True
             self.sm.release(issue.id)
         except Exception as exc:
             logger.exception("[%s] crashed", session_name)
             self.event_log.fail(issue.identifier, workflow_state, run_number, "crash")
+            self.ledger.record_terminal(
+                run_id=run_id,
+                event_type="run_crashed",
+                status="crashed",
+                payload={"error": str(exc), "error_type": exc.__class__.__name__},
+            )
             failed = True
 
             # Track consecutive infra/workspace crashes and bail after MAX attempts
@@ -796,14 +941,19 @@ class Orchestrator:
 
             self.sm.release(issue.id)
         finally:
+            if log_path and log_path.exists():
+                try:
+                    self.ledger.attach_raw_log(run_id, log_path)
+                except Exception:
+                    logger.exception("Failed to attach raw log metadata for %s", session_name)
             # Braintrust: always close run span (crash-safe)
-            if self.tracer and issue.id in self.tracer._runs:
-                self.tracer.end_run(
-                    issue.id,
-                    result if "result" in locals() else RunResult(
-                        success=False, exit_code=-1, error="crash",
-                    ),
-                )
+            self._trace_call(
+                "end_run",
+                issue.id,
+                result if "result" in locals() else RunResult(
+                    success=False, exit_code=-1, error="crash",
+                ),
+            )
 
             # Always release resources (crash-safe)
             if resources:
@@ -922,10 +1072,19 @@ class Orchestrator:
         except Exception:
             logger.warning("Failed to post summary comment for %s", issue.identifier)
 
-    async def _cancel_agent(self, issue_id: str) -> None:
+    async def _cancel_agent(
+        self, issue_id: str, *, terminal_status: str | None = None
+    ) -> None:
         """Cancel a running agent task."""
         agent = self._running.pop(issue_id, None)
         if agent:
+            if terminal_status:
+                self.ledger.record_terminal(
+                    run_id=agent.run_id,
+                    event_type=f"run_{terminal_status}",
+                    status=terminal_status,
+                    payload={"reason": terminal_status},
+                )
             # Release concurrency slot
             if self._concurrency_mgr:
                 await self._concurrency_mgr.release(self.project_slug)
@@ -942,7 +1101,12 @@ class Orchestrator:
             self._running[issue_id].last_activity = time.monotonic()
 
     async def on_agent_complete(
-        self, issue_id: str, success: bool, issue: LinearIssue | None = None,
+        self,
+        issue_id: str,
+        success: bool,
+        issue: LinearIssue | None = None,
+        *,
+        run_id: str | None = None,
     ) -> None:
         """Handle agent completion — transition state, clean up."""
         agent = self._running.pop(issue_id, None)
@@ -1003,6 +1167,13 @@ class Orchestrator:
                     tracked.identifier, tracked.workflow_state, target, signal_to_use.value,
                 )
                 self.event_log.state_change(tracked.identifier, tracked.workflow_state, target)
+                if run_id:
+                    self.ledger.record_transition(
+                        run_id=run_id,
+                        from_state=tracked.workflow_state,
+                        to_state=target,
+                        signal=signal_to_use.value,
+                    )
                 # Transition in Linear
                 target_cfg = self.config.states.get(target)
                 if target_cfg and target_cfg.linear_state:
@@ -1014,8 +1185,7 @@ class Orchestrator:
                             logger.exception("Failed to transition %s in Linear", tracked.identifier)
 
                 if target == "done" or (target_cfg and target_cfg.type == "terminal"):
-                    if self.tracer:
-                        self.tracer.end_issue(issue_id, success=True)
+                    self._trace_call("end_issue", issue_id, success=True)
                     self.sm.untrack_issue(issue_id)
                     self._completed_today.append(tracked.identifier)
                     self._notify_status_change()
@@ -1027,8 +1197,7 @@ class Orchestrator:
                     "%s completed but no valid transition from '%s' (signal=%s) — untracking",
                     tracked.identifier, tracked.workflow_state, signal_to_use.value,
                 )
-                if self.tracer:
-                    self.tracer.end_issue(issue_id, success=False)
+                self._trace_call("end_issue", issue_id, success=False)
                 self.sm.untrack_issue(issue_id)
         else:
             # Agent failed — record state for investigating prompt context
@@ -1070,6 +1239,13 @@ class Orchestrator:
                     "%s failed in '%s' → falling back to '%s'",
                     tracked.identifier, tracked.workflow_state, target,
                 )
+                if run_id:
+                    self.ledger.record_transition(
+                        run_id=run_id,
+                        from_state=tracked.workflow_state,
+                        to_state=target,
+                        signal=Signal.FAIL.value,
+                    )
                 tracked.workflow_state = target
                 self.sm.release(issue_id)
             else:
@@ -1079,8 +1255,7 @@ class Orchestrator:
                     "%s failed in '%s' with no fallback — untracking",
                     tracked.identifier, tracked.workflow_state,
                 )
-                if self.tracer:
-                    self.tracer.end_issue(issue_id, success=False)
+                self._trace_call("end_issue", issue_id, success=False)
                 self.sm.untrack_issue(issue_id)
 
     def _determine_signal(
@@ -1316,6 +1491,12 @@ class Orchestrator:
 
     def status_summary(self) -> dict[str, Any]:
         """Return a status snapshot for the TUI."""
+        if isinstance(self.tracer, AsyncBraintrustProjector) and self.tracer.failure:
+            failure = self.tracer.failure
+            self._replace_warning(
+                "Braintrust",
+                f"Braintrust projection failed ({failure.__class__.__name__}) — tracing disabled",
+            )
         now = time.monotonic()
         interval_s = self.config.polling.interval_ms / 1000
         next_poll_s = max(0, interval_s - (now - self._last_poll_time))
@@ -1325,6 +1506,7 @@ class Orchestrator:
             tracked = self.sm.get_issue(issue_id)
             if tracked:
                 runners[tracked.identifier] = {
+                    "run_id": agent.run_id,
                     "state": agent.workflow_state,
                     "runner": agent.runner_name,
                     "duration_s": now - agent.started_at,
@@ -1351,6 +1533,12 @@ class Orchestrator:
                 for s in self.sm.tracked_issues.values()
             },
             "warnings": list(self._warnings),
+            "reliability": {
+                "mode": self.config.reliability.mode,
+                "ledger_path": str(getattr(self.ledger, "path", "injected")),
+                "read_only": self.ledger.read_only,
+                "schema_version": getattr(self.ledger, "schema_version", None),
+            },
             # Multi-instance metadata
             "project_slug": self.project_slug,
             "config_path": str(self.config_path),
@@ -1361,12 +1549,13 @@ class Orchestrator:
 class _RunningAgent:
     """Internal tracking for a running agent task."""
 
-    __slots__ = ("task", "workflow_state", "started_at", "last_activity",
+    __slots__ = ("task", "run_id", "workflow_state", "started_at", "last_activity",
                  "runner_name", "turns", "tokens", "last_tool", "dispatched_at_iso")
 
     def __init__(
         self,
         task: asyncio.Task,
+        run_id: str,
         workflow_state: str,
         runner_name: str,
         started_at: float,
@@ -1374,6 +1563,7 @@ class _RunningAgent:
         dispatched_at_iso: str | None = None,
     ) -> None:
         self.task = task
+        self.run_id = run_id
         self.workflow_state = workflow_state
         self.runner_name = runner_name
         self.started_at = started_at

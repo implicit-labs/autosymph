@@ -12,6 +12,7 @@ import yaml
 
 from autosymph.config import (
     AgentConfig,
+    ReliabilityConfig,
     StateConfig,
     StateTransitions,
     TrackerConfig,
@@ -21,7 +22,7 @@ from autosymph.config import (
 
 
 @pytest.fixture
-def mock_config_factory():
+def mock_config_factory(tmp_path: Path):
     """Factory for generating valid WorkflowConfig with customizable fields."""
 
     def _make(
@@ -34,6 +35,9 @@ def mock_config_factory():
         cfg = WorkflowConfig(
             tracker=TrackerConfig(project=project, api_key=api_key),
             workspace=WorkspaceConfig(root="/tmp/test-workspaces", repo=repo),
+            reliability=ReliabilityConfig(
+                database_path=str(tmp_path / f"{project}-ledger.sqlite3")
+            ),
             agent=AgentConfig(max_concurrent_agents=max_agents),
             states={
                 "implement": StateConfig(

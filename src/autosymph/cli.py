@@ -474,6 +474,75 @@ def config_check(path: str | None) -> None:
 # -- models commands --
 
 
+def _resolve_ledger_path(database: str | None, config_path: str | None) -> Path:
+    if database:
+        return Path(database).expanduser().resolve()
+    filepath = _find_config(config_path)
+    if filepath.exists():
+        cfg = load_config(filepath)
+        return cfg.reliability.resolved_database_path(cfg.logging.resolved_log_root())
+    return Path("~/.autosymph/logs/factory.sqlite3").expanduser().resolve()
+
+
+@main.group("ledger")
+def ledger_cmd() -> None:
+    """Inspect and export the crash-safe local reliability ledger."""
+
+
+@ledger_cmd.command("check")
+@click.option("--database", type=click.Path(path_type=Path), default=None)
+@click.option("-c", "--config", "config_path", default=None, help="Path to workflow.yaml")
+def ledger_check(database: Path | None, config_path: str | None) -> None:
+    """Verify ledger integrity and print its schema version."""
+    from autosymph.ledger import LedgerError, SQLiteLedger
+
+    path = _resolve_ledger_path(str(database) if database else None, config_path)
+    try:
+        with SQLiteLedger(path, read_only=True) as ledger:
+            result = ledger.check_integrity()
+            click.echo(f"OK — {path}")
+            click.echo(f"  integrity: {result}")
+            click.echo(f"  schema:    {ledger.schema_version}")
+    except LedgerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@ledger_cmd.command("export")
+@click.option("--database", type=click.Path(path_type=Path), default=None)
+@click.option("-c", "--config", "config_path", default=None, help="Path to workflow.yaml")
+@click.option("--format", "export_format", type=click.Choice(["jsonl", "parquet"]), default="jsonl")
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+@click.option("--since", default=None, help="Inclusive ISO-8601 lower bound")
+@click.option("--until", default=None, help="Inclusive ISO-8601 upper bound")
+def ledger_export(
+    database: Path | None,
+    config_path: str | None,
+    export_format: str,
+    output: Path,
+    since: str | None,
+    until: str | None,
+) -> None:
+    """Export a portable snapshot with counts, range, and content hash."""
+    from autosymph.ledger import LedgerError, SQLiteLedger
+
+    path = _resolve_ledger_path(str(database) if database else None, config_path)
+    try:
+        with SQLiteLedger(path, read_only=True) as ledger:
+            if export_format == "parquet":
+                manifest = ledger.export_parquet(output, since=since, until=until)
+            else:
+                manifest = ledger.export_jsonl(output, since=since, until=until)
+    except LedgerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Exported {export_format} — {output.expanduser().resolve()}")
+    click.echo(f"  rows:   {sum(manifest.row_counts.values())}")
+    click.echo(f"  sha256: {manifest.content_sha256}")
+
+
+# -- models commands --
+
+
 @main.group("models")
 def models_cmd() -> None:
     """Manage Claude model registry — check for stale references, refresh from API."""

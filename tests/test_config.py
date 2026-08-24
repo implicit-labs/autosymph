@@ -417,3 +417,22 @@ class TestLayeredConfig:
         assert len(configs) == 1
         assert configs[0][1].project_slug == "exists"
         assert any("missing" in w for w in warnings)
+
+
+class TestReliabilityConfig:
+    def test_defaults_to_observe_and_places_ledger_under_log_root(self, tmp_path):
+        from autosymph.config import ReliabilityConfig
+
+        config = ReliabilityConfig()
+
+        assert config.mode == "observe"
+        assert config.resolved_database_path(tmp_path) == tmp_path / "factory.sqlite3"
+
+    def test_explicit_database_path_wins(self, tmp_path):
+        from autosymph.config import ReliabilityConfig
+
+        path = tmp_path / "custom.db"
+        config = ReliabilityConfig(database_path=str(path), mode="enforce_verify")
+
+        assert config.mode == "enforce_verify"
+        assert config.resolved_database_path(tmp_path) == path.resolve()

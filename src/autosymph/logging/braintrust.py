@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -112,7 +114,7 @@ class BraintrustTracer:
         if issue_id not in self._issue_spans:
             self._issue_spans[issue_id] = self._logger.start_span(
                 name=identifier,
-                type="task",
+                type="task",  # type: ignore[arg-type]  # accepted by Braintrust at runtime
                 metadata={"issue_id": issue_id, "identifier": identifier},
             )
             logger.debug("[bt] started issue span: %s", identifier)
@@ -284,6 +286,76 @@ class BraintrustTracer:
                 entry.span.log(scores={"denied": 1.0})
 
             entry.span.end()
+
+
+@dataclass(frozen=True)
+class _ProjectionCall:
+    method: str
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+
+
+class AsyncBraintrustProjector:
+    """Ordered, non-blocking, fail-soft projection to Braintrust.
+
+    The local ledger commits first. Braintrust calls run sequentially on a
+    daemon thread so provider latency and outages cannot delay or invalidate a
+    factory decision.
+    """
+
+    def __init__(self, tracer: Any, *, max_queue: int = 10_000) -> None:
+        self._tracer = tracer
+        self._queue: queue.Queue[_ProjectionCall | None] = queue.Queue(maxsize=max_queue)
+        self._failure: Exception | None = None
+        self._closed = False
+        self._worker = threading.Thread(
+            target=self._run,
+            name="autosymph-braintrust-projector",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def failure(self) -> Exception | None:
+        return self._failure
+
+    def submit(self, method: str, *args: Any, **kwargs: Any) -> bool:
+        if self._closed or self._failure is not None:
+            return False
+        try:
+            self._queue.put_nowait(_ProjectionCall(method, args, kwargs))
+            return True
+        except queue.Full:
+            logger.warning("Braintrust projection queue full — dropping %s", method)
+            return False
+
+    def _run(self) -> None:
+        while True:
+            call = self._queue.get()
+            try:
+                if call is None:
+                    return
+                if self._failure is None:
+                    getattr(self._tracer, call.method)(*call.args, **call.kwargs)
+            except Exception as exc:
+                self._failure = exc
+                logger.warning(
+                    "Braintrust projection failed — remote tracing disabled",
+                    exc_info=True,
+                )
+            finally:
+                self._queue.task_done()
+
+    def close(self, *, timeout: float = 5.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # Do not block shutdown on an optional projection.
+            return
+        self._worker.join(timeout=timeout)
 
 
 def _extract_detail(tool_name: str, tool_input: dict) -> str:
