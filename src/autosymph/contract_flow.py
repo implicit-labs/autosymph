@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
-from autosymph.config import WorkflowConfig
+from autosymph.config import StateConfig, WorkflowConfig
 from autosymph.factory import FactoryRepository
 from autosymph.receipts import AttemptReceipt, evaluate_proof, write_json_atomic
 from autosymph.runners import default_runner_registry
@@ -258,6 +258,59 @@ def _prompt(contract: ValueContract, skill: str) -> str:
     )
 
 
+def _transition_target(state: StateConfig, signal: Signal) -> str | None:
+    if not state.transitions:
+        return None
+    return dict(state.transitions.items()).get(signal.value)
+
+
+def _resolve_flow_states(
+    factory: FactoryRepository, workflow: WorkflowConfig
+) -> tuple[str, str, str, str]:
+    """Resolve initial agent, verification gate, and terminal outcomes from the
+    compiled factory graph, instead of hardcoding implement/verify/done/blocked."""
+    initial_state = factory.load_workflow().get("initial_state")
+    if not isinstance(initial_state, str) or initial_state not in workflow.states:
+        raise ValueError(
+            f"factory must declare exactly one initial agent state; found {initial_state!r}"
+        )
+    initial_config = workflow.states[initial_state]
+    if initial_config.type != "agent":
+        raise ValueError(f"factory initial_state {initial_state!r} must be an agent state")
+
+    gate_state = _transition_target(initial_config, Signal.COMPLETE)
+    if not isinstance(gate_state, str) or gate_state not in workflow.states:
+        raise ValueError(
+            f"factory initial_state {initial_state!r} must have a 'complete' transition "
+            "to exactly one verification gate"
+        )
+    gate_config = workflow.states[gate_state]
+    if gate_config.type != "gate":
+        raise ValueError(f"factory state {gate_state!r} must be a verification gate")
+
+    approve_state = _transition_target(gate_config, Signal.APPROVE)
+    if (
+        not isinstance(approve_state, str)
+        or approve_state not in workflow.states
+        or workflow.states[approve_state].type != "terminal"
+    ):
+        raise ValueError(
+            f"factory verification gate {gate_state!r} must have an 'approve' transition "
+            "to a terminal state"
+        )
+    fail_state = _transition_target(gate_config, Signal.FAIL)
+    if (
+        not isinstance(fail_state, str)
+        or fail_state not in workflow.states
+        or workflow.states[fail_state].type != "terminal"
+    ):
+        raise ValueError(
+            f"factory verification gate {gate_state!r} must have a 'fail' transition "
+            "to a terminal state"
+        )
+    return initial_state, gate_state, approve_state, fail_state
+
+
 async def run_contract_flow(
     *,
     factory: FactoryRepository,
@@ -280,22 +333,23 @@ async def run_contract_flow(
     if runner_profile not in SAMPLE_PROFILES:
         raise ValueError(f"unknown runner profile {runner_profile!r}")
     profile = SAMPLE_PROFILES[runner_profile]
+    initial_state, gate_state, approve_state, fail_state = _resolve_flow_states(factory, workflow)
     machine = StateMachine(workflow)
-    tracked = machine.track_issue(contract.name, contract.name.upper(), "implement")
+    tracked = machine.track_issue(contract.name, contract.name.upper(), initial_state)
     states = [tracked.workflow_state]
     evidence = workspace / ".autosymph" / "evidence" / contract.name
     evidence.mkdir(parents=True, exist_ok=True)
-    raw_log = evidence / "implement-run1.ndjson"
+    raw_log = evidence / f"{initial_state}-run1.ndjson"
     prompt = _prompt(
         contract,
-        (factory.state_path("implement") / "SKILL.md").read_text(),
+        (factory.state_path(initial_state) / "SKILL.md").read_text(),
     )
     adapter = (runner_registry or default_runner_registry())[profile.type]
     runner_config = {
         **profile.model_dump(),
         "identifier": contract.name.upper(),
-        "workflow_state": "implement",
-        "prompt_path": str(factory.state_path("implement") / "SKILL.md"),
+        "workflow_state": initial_state,
+        "prompt_path": str(factory.state_path(initial_state) / "SKILL.md"),
         "runner": runner_profile,
     }
 
@@ -313,8 +367,8 @@ async def run_contract_flow(
     snapshot = evidence / "workspace-subject.json"
     changed = _write_workspace_snapshot(workspace, snapshot)
     receipt = AttemptReceipt.from_run(
-        attempt_id=f"{contract.name}-implement-1",
-        state="implement",
+        attempt_id=f"{contract.name}-{initial_state}-1",
+        state=initial_state,
         runner_profile=runner_profile,
         adapter_type=profile.type,
         model=profile.model,
@@ -330,10 +384,10 @@ async def run_contract_flow(
     receipt_path = evidence / "attempt-receipt.json"
     write_json_atomic(receipt_path, receipt.as_dict())
     target = machine.next_state(
-        "implement", Signal.COMPLETE if result.success else Signal.FAIL, contract.name
+        initial_state, Signal.COMPLETE if result.success else Signal.FAIL, contract.name
     )
-    if target != "verify":
-        states.append(target or "blocked")
+    if target != gate_state:
+        states.append(target or fail_state)
         return ContractFlowResult(
             False,
             contract.name,
@@ -346,8 +400,8 @@ async def run_contract_flow(
             "",
             str(raw_log),
         )
-    tracked.workflow_state = "verify"
-    states.append("verify")
+    tracked.workflow_state = gate_state
+    states.append(gate_state)
 
     state_input = evidence / "state-input.json"
     state_output = evidence / "state-output.json"
@@ -357,8 +411,8 @@ async def run_contract_flow(
         {"runner_success": result.success, "changed_paths": list(changed)},
     )
     state_validation = run_compiled_state_phase(
-        "implement",
-        workflow.states["implement"],
+        initial_state,
+        workflow.states[initial_state],
         "validate",
         state_input,
         state_output,
@@ -434,11 +488,11 @@ async def run_contract_flow(
         required_checks={str(check["name"]) for check in proof_checks},
     )
     final = machine.next_state(
-        "verify", Signal.APPROVE if gate.allowed else Signal.FAIL, contract.name
+        gate_state, Signal.APPROVE if gate.allowed else Signal.FAIL, contract.name
     )
-    states.append(final or "blocked")
+    states.append(final or fail_state)
     flow_result = ContractFlowResult(
-        gate.allowed and final == "done",
+        gate.allowed and final == approve_state,
         contract.name,
         str(workspace),
         runner_profile,

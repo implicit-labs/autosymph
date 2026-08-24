@@ -186,3 +186,169 @@ def test_contract_flow_rejects_non_git_workspace(tmp_path: Path):
                 runner_registry={"claude": EditingRunner("value.txt")},
             )
         )
+
+
+def _build_quality_factory(tmp_path: Path) -> tuple[FactoryRepository, object]:
+    """A factory using state names other than implement/verify/done/blocked."""
+    repository = FactoryRepository(tmp_path / "build-factory")
+    repository.initialize("build-quality-factory", initial_state="build")
+    repository.create_state("shipped", kind="terminal", description="Accept.", runner=None)
+    repository.create_state("stopped", kind="terminal", description="Reject.", runner=None)
+    repository.create_state(
+        "quality",
+        kind="gate",
+        description="Verify proof.",
+        runner=None,
+        transitions=[
+            {"signal": "approve", "target": "shipped"},
+            {"signal": "fail", "target": "stopped"},
+        ],
+    )
+    repository.create_state(
+        "build",
+        kind="agent",
+        description="Make the contracted change.",
+        runner="claude-code",
+        transitions=[
+            {"signal": "complete", "target": "quality"},
+            {"signal": "fail", "target": "stopped"},
+        ],
+    )
+    workflow = repository.compile_workflow(
+        tracker=TrackerConfig(project="local", api_key="unused"),
+        runners=RunnersConfig(
+            default="claude-code",
+            available={"claude-code": SAMPLE_PROFILES["claude-code"]},
+        ),
+    )
+    return repository, workflow
+
+
+def test_contract_flow_uses_compiled_factory_state_names(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    repository, workflow = _build_quality_factory(tmp_path)
+
+    result = asyncio.run(
+        run_contract_flow(
+            factory=repository,
+            workflow=workflow,
+            contract=_contract(),
+            workspace=workspace,
+            runner_profile="claude-code",
+            runner_registry={"claude": EditingRunner("value.txt")},
+        )
+    )
+
+    assert result.success is True
+    assert result.states == ("build", "quality", "shipped")
+    assert Path(result.receipt_path).is_file()
+    assert Path(result.proof_path).is_file()
+
+
+def test_contract_flow_rejects_non_agent_initial_state(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    repository = FactoryRepository(tmp_path / "bad-initial-factory")
+    repository.initialize("bad-initial-factory", initial_state="entry")
+    repository.create_state("done", kind="terminal", description="Accept.", runner=None)
+    repository.create_state(
+        "entry",
+        kind="gate",
+        description="Not an agent.",
+        runner=None,
+        transitions=[{"signal": "approve", "target": "done"}],
+    )
+    workflow = repository.compile_workflow(
+        tracker=TrackerConfig(project="local", api_key="unused"),
+        runners=RunnersConfig(default="claude-code"),
+    )
+
+    with pytest.raises(ValueError, match="must be an agent state"):
+        asyncio.run(
+            run_contract_flow(
+                factory=repository,
+                workflow=workflow,
+                contract=_contract(),
+                workspace=workspace,
+                runner_profile="claude-code",
+                runner_registry={"claude": EditingRunner("value.txt")},
+            )
+        )
+
+
+def test_contract_flow_rejects_agent_without_complete_transition(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    repository = FactoryRepository(tmp_path / "bad-gate-factory")
+    repository.initialize("bad-gate-factory", initial_state="build")
+    repository.create_state("stopped", kind="terminal", description="Reject.", runner=None)
+    repository.create_state(
+        "build",
+        kind="agent",
+        description="Never completes.",
+        runner="claude-code",
+        transitions=[{"signal": "fail", "target": "stopped"}],
+    )
+    workflow = repository.compile_workflow(
+        tracker=TrackerConfig(project="local", api_key="unused"),
+        runners=RunnersConfig(
+            default="claude-code",
+            available={"claude-code": SAMPLE_PROFILES["claude-code"]},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="verification gate"):
+        asyncio.run(
+            run_contract_flow(
+                factory=repository,
+                workflow=workflow,
+                contract=_contract(),
+                workspace=workspace,
+                runner_profile="claude-code",
+                runner_registry={"claude": EditingRunner("value.txt")},
+            )
+        )
+
+
+def test_contract_flow_rejects_gate_approve_to_non_terminal(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    repository = FactoryRepository(tmp_path / "bad-terminal-factory")
+    repository.initialize("bad-terminal-factory", initial_state="build")
+    repository.create_state("stopped", kind="terminal", description="Reject.", runner=None)
+    repository.create_state(
+        "quality",
+        kind="gate",
+        description="Approves back into the agent, not a terminal.",
+        runner=None,
+        transitions=[
+            {"signal": "approve", "target": "build"},
+            {"signal": "fail", "target": "stopped"},
+        ],
+    )
+    repository.create_state(
+        "build",
+        kind="agent",
+        description="Make the contracted change.",
+        runner="claude-code",
+        transitions=[
+            {"signal": "complete", "target": "quality"},
+            {"signal": "fail", "target": "stopped"},
+        ],
+    )
+    workflow = repository.compile_workflow(
+        tracker=TrackerConfig(project="local", api_key="unused"),
+        runners=RunnersConfig(
+            default="claude-code",
+            available={"claude-code": SAMPLE_PROFILES["claude-code"]},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="approve.*terminal state"):
+        asyncio.run(
+            run_contract_flow(
+                factory=repository,
+                workflow=workflow,
+                contract=_contract(),
+                workspace=workspace,
+                runner_profile="claude-code",
+                runner_registry={"claude": EditingRunner("value.txt")},
+            )
+        )
